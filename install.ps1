@@ -12,6 +12,10 @@ param(
     [ValidateSet('Remove', 'Restore')]
     [string]$Action = 'Remove',
 
+    # Also hide the UAC shield overlay (Shell Icons value 77).
+    # Opt-in: the shield is a warning indicator, so it is never hidden by default.
+    [switch]$IncludeShield,
+
     [switch]$NoRestart
 )
 
@@ -23,7 +27,7 @@ $BaseUrl = 'https://raw.githubusercontent.com/' + $Repo + '/' + $Branch
 $ScriptName = 'ShortcutArrow.ps1'
 $DestDir = Join-Path $env:LOCALAPPDATA 'ShortcutArrow'
 $Target  = Join-Path $DestDir $ScriptName
-$BatFiles = @('Remove-ShortcutArrow.bat', 'Restore-ShortcutArrow.bat')
+$BatFiles = @('Remove-ShortcutArrow.bat', 'Remove-ArrowAndShield.bat', 'Restore-ShortcutArrow.bat')
 
 function Test-IsAdmin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -105,7 +109,8 @@ if (-not (Test-IsAdmin)) {
         '-File', ('"' + $Target + '"'),
         '-Action', $Action
     )
-    if ($NoRestart) { $argList += '-NoRestart' }
+    if ($IncludeShield) { $argList += '-IncludeShield' }
+    if ($NoRestart)     { $argList += '-NoRestart' }
     try {
         Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $argList | Out-Null
     } catch {
@@ -118,5 +123,6 @@ if (-not (Test-IsAdmin)) {
 # -------------------------------------------------------------------- 3. run
 Write-Host ''
 $forward = @('-Action', $Action)
-if ($NoRestart) { $forward += '-NoRestart' }
+if ($IncludeShield) { $forward += '-IncludeShield' }
+if ($NoRestart)     { $forward += '-NoRestart' }
 & $Target @forward

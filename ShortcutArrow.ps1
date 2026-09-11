@@ -1,27 +1,42 @@
 <#
-    Shortcut Arrow overlay tweak for Windows 10 / 11
+    Shortcut overlay tweak for Windows 10 / 11
     ------------------------------------------------------------------
-    Removes the little arrow overlay drawn on shortcut icons by
-    overriding the shell overlay icon (Shell Icons value 29) with a
-    fully transparent icon.
+    Hides the two shell overlays that are painted on top of icons:
+
+      Shell Icons value 29  ->  the shortcut arrow
+      Shell Icons value 77  ->  the UAC shield (elevation indicator)
+
+    Both are pure overlay icons. Replacing them with a fully transparent
+    icon hides the overlay without touching anything else.
 
     Why not just delete IsShortcut?
-      Deleting HKCR\lnkfile\IsShortcut also hides the arrow, but it
-      makes Windows stop treating .lnk as a shortcut. Known fallout:
+      Deleting HKCR\lnkfile\IsShortcut also hides the arrow, but it makes
+      Windows stop treating .lnk as a shortcut. Known fallout:
         - "Pin to taskbar" / "Pin to Start" disappear or stop working
         - Launching a shortcut may fail with
           "This file does not have an app associated with it"
         - Drag & drop onto the taskbar breaks
       This script never touches IsShortcut.
 
+    ABOUT THE SHIELD - READ THIS
+      The shield is a WARNING, not a protection. Hiding it does NOT stop
+      the program from requesting administrator rights: the UAC prompt
+      still appears and the program still elevates. What you lose is the
+      visual hint that a program is about to ask for admin.
+
+      Hiding the shield is opt-in (-IncludeShield) and is never done by
+      default. This script does NOT and will NOT edit executable
+      manifests or disable UAC.
+
     Usage:
-      ShortcutArrow.ps1 -Action Remove
-      ShortcutArrow.ps1 -Action Restore
+      ShortcutArrow.ps1 -Action Remove                     # arrow only
+      ShortcutArrow.ps1 -Action Remove -IncludeShield      # arrow + shield
+      ShortcutArrow.ps1 -Action Restore                    # restore both
 
     Options:
       -Action         Remove (default) | Restore
-      -UseSystemIcon  use "%SystemRoot%\System32\imageres.dll,195"
-                      instead of a generated .ico file
+      -IncludeShield  also hide the UAC shield overlay (value 77)
+      -UseSystemIcon  use a built-in blank icon instead of a generated .ico
       -NoRestart      do not restart explorer.exe
 
     The transparent icon is stored in
@@ -33,6 +48,8 @@ param(
     [ValidateSet('Remove', 'Restore')]
     [string]$Action = 'Remove',
 
+    [switch]$IncludeShield,
+
     [switch]$UseSystemIcon,
 
     [switch]$NoRestart
@@ -40,13 +57,21 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '1.1.0'
+$ScriptVersion = '1.2.0'
 $BaseDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
 $IcoDir   = Join-Path $env:LOCALAPPDATA 'ShortcutArrow'
 $IcoPath  = Join-Path $IcoDir 'blank.ico'
 $LogPath  = Join-Path $BaseDir 'ShortcutArrow.log'
 $KeyTail  = 'SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Icons'
-$SysIcon  = '%SystemRoot%\System32\imageres.dll,195'
+
+# Overlay slot numbers. 29 = shortcut arrow, 77 = UAC shield.
+$ArrowSlot  = '29'
+$ShieldSlot = '77'
+
+# Built-in fully transparent icons, verified with a pixel scan:
+#   imageres.dll,195   Alpha = 0 on Windows 11 build 26200
+#   shell32.dll,50     Alpha = 0, and is what most published guides use
+$SystemIcon = '%SystemRoot%\System32\shell32.dll,50'
 
 function Write-Log {
     param([string]$Message)
@@ -145,11 +170,8 @@ function Clear-IconCache {
         if (Test-Path -LiteralPath $t.Dir) {
             Get-ChildItem -LiteralPath $t.Dir -Filter $t.Filter -Force -ErrorAction SilentlyContinue |
                 ForEach-Object {
-                    try {
-                        Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop
-                    } catch {
-                        Write-Log ('  cache locked, skipped: ' + $_.Name)
-                    }
+                    try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop }
+                    catch { Write-Log ('  cache locked, skipped: ' + $_.Name) }
                 }
         }
     }
@@ -166,41 +188,42 @@ function Restart-Explorer {
     }
 }
 
-function Set-ArrowOverride {
-    param([string]$Hive, [string]$Value)
+function Set-OverlaySlot {
+    param([string]$Hive, [string]$Slot, [string]$IconValue)
 
     $path = Join-Path $Hive $KeyTail
     try {
         if (-not (Test-Path -LiteralPath $path)) {
             New-Item -Path $path -Force | Out-Null
         }
-        New-ItemProperty -Path $path -Name '29' -Value $Value -PropertyType String -Force | Out-Null
-        Write-Log ('  OK   ' + $Hive + ' value 29 = ' + $Value)
+        New-ItemProperty -Path $path -Name $Slot -Value $IconValue -PropertyType String -Force | Out-Null
+        Write-Log ('  OK   ' + $Hive + ' value ' + $Slot + ' = ' + $IconValue)
         return $true
     } catch {
-        Write-Log ('  FAIL ' + $Hive + ' not writable (run as Administrator)')
+        Write-Log ('  FAIL ' + $Hive + ' value ' + $Slot + ' not writable (run as Administrator)')
         return $false
     }
 }
 
-function Remove-ArrowOverride {
-    param([string]$Hive)
+function Remove-OverlaySlot {
+    param([string]$Hive, [string]$Slot)
 
     $path = Join-Path $Hive $KeyTail
     if (-not (Test-Path -LiteralPath $path)) {
-        Write-Log ('  skip ' + $Hive + ' (key absent)')
+        Write-Log ('  skip ' + $Hive + ' value ' + $Slot + ' (key absent)')
         return
     }
-    $existing = Get-ItemProperty -Path $path -Name '29' -ErrorAction SilentlyContinue
+    $existing = Get-ItemProperty -Path $path -Name $Slot -ErrorAction SilentlyContinue
     if ($null -eq $existing) {
-        Write-Log ('  skip ' + $Hive + ' (value absent)')
+        Write-Log ('  skip ' + $Hive + ' value ' + $Slot + ' (not set)')
         return
     }
+    $old = $existing.$Slot
     try {
-        Remove-ItemProperty -Path $path -Name '29' -Force -ErrorAction Stop
-        Write-Log ('  OK   ' + $Hive + ' value 29 removed')
+        Remove-ItemProperty -Path $path -Name $Slot -Force -ErrorAction Stop
+        Write-Log ('  OK   ' + $Hive + ' value ' + $Slot + ' removed (was: ' + $old + ')')
     } catch {
-        Write-Log ('  FAIL ' + $Hive + ' not writable (run as Administrator)')
+        Write-Log ('  FAIL ' + $Hive + ' value ' + $Slot + ' not writable (run as Administrator)')
     }
 }
 
@@ -208,13 +231,16 @@ function Remove-ArrowOverride {
 # main
 # ----------------------------------------------------------------------------
 $isAdmin = Test-IsAdmin
-Write-Log ('=== ShortcutArrow v' + $ScriptVersion + '  Action=' + $Action + '  Admin=' + $isAdmin + ' ===')
+Write-Log ('=== ShortcutArrow v' + $ScriptVersion + '  Action=' + $Action + '  IncludeShield=' + [bool]$IncludeShield + '  Admin=' + $isAdmin + ' ===')
 
 if ($Action -eq 'Remove') {
 
+    $slots = @($ArrowSlot)
+    if ($IncludeShield) { $slots += $ShieldSlot }
+
     if ($UseSystemIcon) {
-        $iconValue = $SysIcon
-        Write-Log ('  using built-in icon: ' + $iconValue)
+        $iconValue = $SystemIcon
+        Write-Log ('  using built-in transparent icon: ' + $iconValue)
     }
     else {
         if (-not (Test-Path -LiteralPath $IcoPath)) {
@@ -225,33 +251,43 @@ if ($Action -eq 'Remove') {
         Write-Log ('  icon ready (' + (Get-Item -LiteralPath $IcoPath).Length + ' bytes)')
     }
 
-    if ($isAdmin) {
-        [void](Set-ArrowOverride -Hive 'HKLM:' -Value $iconValue)
-    } else {
-        Write-Log '  not elevated - HKLM cannot be written, using HKCU only'
+    foreach ($slot in $slots) {
+        if ($slot -eq $ShieldSlot) {
+            Write-Log '  note: hiding the shield only hides the warning icon.'
+            Write-Log '        Programs that need admin will still raise a UAC prompt.'
+        }
+        if ($isAdmin) {
+            [void](Set-OverlaySlot -Hive 'HKLM:' -Slot $slot -IconValue $iconValue)
+        } else {
+            Write-Log ('  not elevated - HKLM value ' + $slot + ' cannot be written, using HKCU only')
+        }
+        [void](Set-OverlaySlot -Hive 'HKCU:' -Slot $slot -IconValue $iconValue)
     }
-    [void](Set-ArrowOverride -Hive 'HKCU:' -Value $iconValue)
 
     Clear-IconCache
     if (-not $NoRestart) { Restart-Explorer }
 
-    Write-Log '=== done. Shortcut arrows are hidden. ==='
+    Write-Log '=== done. ==='
     if (-not $isAdmin) {
         Write-Log 'NOTE: re-run as Administrator for a system-wide effect.'
     }
-    if ($UseSystemIcon) {
-        Write-Log 'NOTE: if the arrow looks wrong, re-run without -UseSystemIcon.'
+    if (-not $IncludeShield) {
+        Write-Log 'NOTE: the UAC shield was left untouched. Add -IncludeShield to hide it too.'
     }
 }
 else {
-    if ($isAdmin) { Remove-ArrowOverride -Hive 'HKLM:' }
-    else { Write-Log '  not elevated - HKLM not checked' }
-    Remove-ArrowOverride -Hive 'HKCU:'
+    # Restore always clears BOTH slots, so a hidden shield can never linger
+    # by accident after a partial run.
+    foreach ($slot in @($ArrowSlot, $ShieldSlot)) {
+        if ($isAdmin) { Remove-OverlaySlot -Hive 'HKLM:' -Slot $slot }
+        else { Write-Log ('  not elevated - HKLM value ' + $slot + ' not checked') }
+        Remove-OverlaySlot -Hive 'HKCU:' -Slot $slot
+    }
 
     Clear-IconCache
     if (-not $NoRestart) { Restart-Explorer }
 
-    Write-Log '=== done. Shortcut arrows restored. ==='
+    Write-Log '=== done. Shortcut arrow and UAC shield restored to Windows defaults. ==='
     if (Test-Path -LiteralPath $IcoDir) {
         Write-Log ('NOTE: generated icon folder left in place: ' + $IcoDir)
     }
