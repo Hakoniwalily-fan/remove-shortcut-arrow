@@ -1,87 +1,278 @@
-# 去掉 Windows 桌面快捷方式小箭头
+<div align="center">
 
-用**遮挡层图标替换法**去掉 Windows 10 / 11 桌面快捷方式左下角那个丑丑的小箭头。
+# Remove Shortcut Arrow
 
-**不碰 `IsShortcut`**，所以「固定到任务栏」「固定到开始屏幕」、拖放等快捷方式功能全部保持正常。
+**Safely remove the little arrow overlay from Windows 10 / 11 desktop shortcuts.**
+
+[![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6?logo=windows&logoColor=white)](#requirements)
+[![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-5391FE?logo=powershell&logoColor=white)](#requirements)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
+[English](#english) · [中文说明](#中文说明)
+
+</div>
 
 ---
 
-## 为什么不用网上那个「删除 IsShortcut」的方法
+## One-line install
 
-搜「去掉快捷方式箭头」，排在前面的几乎都是让你删掉注册表里
-`HKEY_CLASSES_ROOT\lnkfile` 下的 `IsShortcut` 值。这个方法确实能让箭头消失，
-但代价是系统不再把 `.lnk` 当成「快捷方式」，典型后果：
+Open **PowerShell as Administrator** and run:
 
-| 症状 | 说明 |
+```powershell
+irm https://raw.githubusercontent.com/Hakoniwalily-fan/remove-shortcut-arrow/main/install.ps1 | iex
+```
+
+That downloads the script, generates the transparent icon, applies the registry
+change, clears the icon cache and restarts Explorer. The arrow disappears.
+
+To put the arrow back:
+
+```powershell
+& "$env:LOCALAPPDATA\ShortcutArrow\ShortcutArrow.ps1" -Action Restore
+```
+
+Prefer no one-liner? Grab the [latest release](https://github.com/Hakoniwalily-fan/remove-shortcut-arrow/releases/latest)
+and double-click `Remove-ShortcutArrow.bat`.
+
+---
+
+## Why not just delete `IsShortcut`?
+
+Almost every "how to remove the shortcut arrow" guide tells you to delete the
+`IsShortcut` value under `HKEY_CLASSES_ROOT\lnkfile`. **Don't.** That makes
+Windows stop treating `.lnk` as a shortcut at all, and you get:
+
+| Symptom | What actually breaks |
 |---|---|
-| 「固定到任务栏」/「固定到开始屏幕」消失 | 右键菜单里这两项直接没了，或点了没反应 |
-| 双击快捷方式报错 | 「该文件没有与之关联的应用来执行该操作。请安装应用……」 |
-| 拖放到任务栏失效 | 无法把程序拖到任务栏固定 |
-| 开始菜单搜索异常 | 快捷方式索引行为改变 |
+| "Pin to taskbar" / "Pin to Start" vanish or do nothing | Shell no longer recognises the file as a shortcut |
+| Double-clicking errors out | *"This file does not have an app associated with it. Please install an app..."* |
+| Dragging onto the taskbar stops working | Taskbar pinning path relies on the shortcut association |
+| Start menu search behaves oddly | Linking/indexing of shortcuts changes |
 
-想恢复还得把 `IsShortcut` 加回去、重建图标缓存、有时还得动组策略，很折腾。
+Undoing it means adding `IsShortcut` back, rebuilding the icon cache, and
+sometimes touching Group Policy — a lot of pain for a cosmetic change.
 
-**本项目只改「画在图标上的那个覆盖层」，不动文件类型关联**，所以没有上述副作用。
+**This project never touches `IsShortcut`.** It only swaps the *overlay icon*
+painted on top of the shortcut icon, so every shortcut behaviour stays intact.
 
 ---
 
-## 原理
+## How it works
 
-Windows 的快捷方式箭头是一个**图标覆盖层（icon overlay）**，由注册表指定：
+The shortcut arrow is not part of the icon file. It is an **icon overlay**
+registered in the shell:
 
 ```
 HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Icons
-    值名: 29        (REG_SZ)
-    值数据: <图标文件路径>
+    Value name : 29        (REG_SZ)
+    Value data : <path to an icon>
 ```
 
-`29` 就是「快捷方式覆盖层」的编号。把它指向一个**全透明的 .ico**，
-箭头照画，只是画出来什么都没有 —— 视觉上箭头就消失了。
+`29` is the overlay slot for shortcuts. Point it at a **fully transparent icon**
+and the arrow is still drawn — it just draws nothing.
 
-本项目用脚本**即时生成**这个透明图标（16 / 32 / 48 三种尺寸，
-纯手工拼 ICO 二进制，逐像素 Alpha = 0），不依赖任何预置文件。
+The script builds that transparent `.ico` from scratch at runtime (16 / 32 / 48
+px, hand-assembled ICO binary, every pixel Alpha = 0). No bundled binary, no
+downloaded asset, nothing to trust.
 
-图标存放在固定位置：
+### Why the icon lives in `%LOCALAPPDATA%`
+
+The registry stores an **absolute path**. Most similar tools generate the icon
+next to the script — so the moment you move or rename that folder, the registry
+points at a file that no longer exists and the arrow silently comes back after
+the next Explorer restart or reboot.
+
+This script stores it at a stable location instead:
 
 ```
 %LOCALAPPDATA%\ShortcutArrow\blank.ico
 ```
 
-放在这里而不是脚本旁边，是因为**脚本目录可以被随意移动/重命名，
-而注册表里记的是绝对路径**——放在稳定位置就不会因为挪动文件夹而失效。
+---
+
+## Requirements
+
+- Windows 10 or Windows 11
+- Windows PowerShell 5.1 (built in) or PowerShell 7+
+- Administrator rights (writes to `HKEY_LOCAL_MACHINE`)
+- No admin? The script still runs and falls back to `HKEY_CURRENT_USER`, and
+  tells you so in the log.
 
 ---
 
-## 环境要求
+## Usage
 
-- Windows 10 或 Windows 11
-- Windows PowerShell 5.1（系统自带）或 PowerShell 7+
-- 需要**管理员权限**（写 `HKEY_LOCAL_MACHINE`）
-
----
-
-## 使用方法
-
-### 一键（推荐）
-
-1. 下载本仓库（`Code` → `Download ZIP`，或 `git clone`）
-2. 双击 **`Remove-ShortcutArrow.bat`**
-3. UAC 弹窗点「是」
-4. 任务栏会闪一下（explorer 重启），完成
-
-### 恢复箭头
-
-双击 **`Restore-ShortcutArrow.bat`**，同样点「是」。
-
-### 手动调用
+### Installer (recommended)
 
 ```powershell
-# 去掉箭头
-powershell -NoProfile -ExecutionPolicy Bypass -File .\ShortcutArrow.ps1 -Action Remove
-
-# 恢复箭头
-powershell -NoProfile -ExecutionPolicy Bypass -File .\ShortcutArrow.ps1 -Action Restore
+irm https://raw.githubusercontent.com/Hakoniwalily-fan/remove-shortcut-arrow/main/install.ps1 | iex
 ```
+
+`install.ps1` downloads the current script into `%LOCALAPPDATA%\ShortcutArrow\`
+and re-launches itself elevated if needed.
+
+### Straight from a clone
+
+```powershell
+.\ShortcutArrow.ps1 -Action Remove     # remove the arrow
+.\ShortcutArrow.ps1 -Action Restore    # put it back
+```
+
+### Double-click
+
+| File | Purpose |
+|---|---|
+| `Remove-ShortcutArrow.bat` | removes the arrow (asks for UAC) |
+| `Restore-ShortcutArrow.bat` | restores it |
+
+### Options
+
+| Parameter | Description |
+|---|---|
+| `-Action Remove` | hide the arrow (default) |
+| `-Action Restore` | restore the arrow |
+| `-UseSystemIcon` | use the built-in blank icon `imageres.dll,195` instead of generating a `.ico` |
+| `-NoRestart` | don't restart Explorer; takes effect after the next restart |
+
+> `-UseSystemIcon` was measured as fully transparent (Alpha = 0) on Windows 11
+> build 26200. Icon indices can shift between Windows versions, which is why the
+> default is the self-generated `.ico` — that can never point at the wrong icon.
+
+---
+
+## What the script changes
+
+**`-Action Remove`**
+
+1. Generates a fully transparent `blank.ico` in `%LOCALAPPDATA%\ShortcutArrow\`
+   (skipped if it already exists)
+2. Sets `Shell Icons` value `29` to that icon
+   - elevated → `HKLM` (documented location, machine-wide)
+   - not elevated → falls back to `HKCU`
+3. Clears the icon cache (`IconCache.db`, `iconcache_*.db`, `thumbcache_*.db`)
+4. Restarts `explorer.exe`
+
+**`-Action Restore`**
+
+1. Deletes value `29` from `HKLM` and `HKCU`
+2. Clears the icon cache
+3. Restarts `explorer.exe`
+
+Every run appends to `ShortcutArrow.log` next to the script. Check it first when
+something looks wrong.
+
+---
+
+## FAQ
+
+**The arrow is still there.**
+Check `ShortcutArrow.log` for `FAIL ... not writable`. You almost certainly ran
+it without Administrator rights.
+
+**The arrow came back after a reboot.**
+The icon path in the registry went stale — usually because `blank.ico` was
+deleted. Re-run the installer.
+
+**The arrow came back after a Windows feature update.**
+Cumulative updates sometimes reset this registry key. Re-run the script.
+
+**Now I can't tell shortcuts from real files.**
+That is unavoidable — without the arrow they look identical. If what you wanted
+was *prettier* rather than *gone*, point value `29` at your own subtle arrow
+icon; everything else stays the same.
+
+**Antivirus flagged it.**
+The script edits the registry and restarts Explorer, which looks suspicious to
+heuristics. The whole thing is one readable PowerShell file.
+
+---
+
+## Uninstall
+
+```powershell
+& "$env:LOCALAPPDATA\ShortcutArrow\ShortcutArrow.ps1" -Action Restore
+Remove-Item "$env:LOCALAPPDATA\ShortcutArrow" -Recurse -Force
+```
+
+### Manual restore
+
+`Win+R` → `regedit` → go to:
+
+```
+HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Icons
+```
+
+Delete the string value named `29`. Check the same path under
+`HKEY_CURRENT_USER` too. Then reboot.
+
+---
+
+## 中文说明
+
+**用「遮挡层图标替换法」去掉 Windows 10 / 11 桌面快捷方式左下角的小箭头，不影响任何快捷方式功能。**
+
+### 一行安装
+
+以**管理员身份**打开 PowerShell，执行：
+
+```powershell
+irm https://raw.githubusercontent.com/Hakoniwalily-fan/remove-shortcut-arrow/main/install.ps1 | iex
+```
+
+想恢复箭头：
+
+```powershell
+& "$env:LOCALAPPDATA\ShortcutArrow\ShortcutArrow.ps1" -Action Restore
+```
+
+### 为什么不用网上那个「删除 IsShortcut」的方法
+
+搜「去掉快捷方式箭头」，排前面的几乎都是让你删掉
+`HKEY_CLASSES_ROOT\lnkfile` 下的 `IsShortcut` 值。**别这么做**——那会让系统
+不再把 `.lnk` 当作快捷方式，后果是：
+
+| 症状 | 原因 |
+|---|---|
+| 「固定到任务栏」/「固定到开始屏幕」消失或点击无效 | 外壳不再把该文件识别为快捷方式 |
+| 双击快捷方式报错 | 「该文件没有与之关联的应用来执行该操作」 |
+| 拖放到任务栏失效 | 固定流程依赖快捷方式关联 |
+| 开始菜单搜索异常 | 快捷方式的索引行为被改变 |
+
+想恢复还得把 `IsShortcut` 加回去、重建图标缓存，有时还要动组策略。
+
+**本项目完全不碰 `IsShortcut`**，只替换画在图标上的那层覆盖图标，所以快捷方式的
+识别、固定、拖放等行为全部正常。
+
+### 原理
+
+箭头是一个**图标覆盖层**，由注册表指定：
+
+```
+HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Icons
+    值名: 29        (REG_SZ)
+    值数据: <图标路径>
+```
+
+`29` 就是快捷方式覆盖层的编号。指向一个**全透明图标**，箭头照画，只是画出来什么都没有。
+
+脚本在运行时**自己拼出**这个透明 `.ico`（16 / 32 / 48 三种尺寸，逐像素 Alpha = 0），
+不依赖任何预置文件。
+
+### 图标为什么放在 `%LOCALAPPDATA%`
+
+注册表里存的是**绝对路径**。多数同类工具把图标生成在脚本旁边——你一旦移动或重命名
+那个文件夹，路径就失效，**重启后箭头会悄悄回来**。
+
+本脚本把它放在固定位置：`%LOCALAPPDATA%\ShortcutArrow\blank.ico`
+
+### 文件
+
+| 文件 | 用途 |
+|---|---|
+| `install.ps1` | 一行安装入口，自动处理提权 |
+| `ShortcutArrow.ps1` | 主脚本（Remove / Restore） |
+| `Remove-ShortcutArrow.bat` | 双击去箭头 |
+| `Restore-ShortcutArrow.bat` | 双击恢复箭头 |
 
 ### 参数
 
@@ -89,112 +280,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\ShortcutArrow.ps1 -Action 
 |---|---|
 | `-Action Remove` | 去掉箭头（默认） |
 | `-Action Restore` | 恢复箭头 |
-| `-UseSystemIcon` | 改用系统自带的空白图标 `imageres.dll,195`，不生成 .ico 文件 |
-| `-NoRestart` | 不重启 explorer，改动在下次重启后生效 |
-
-> `-UseSystemIcon` 在 Windows 11 build 26200 上实测该索引为完全透明（Alpha=0）。
-> 但**图标索引可能随 Windows 版本变动**，所以默认走「自己生成 .ico」这条更确定的路。
-
----
-
-## 脚本做了什么
-
-**`-Action Remove`**
-
-1. 在 `%LOCALAPPDATA%\ShortcutArrow\` 生成全透明的 `blank.ico`（已存在则跳过）
-2. 写注册表 `Shell Icons` 值 `29` → 该图标
-   - 管理员运行：写 `HKLM`（官方文档位置，全机器生效）
-   - 非管理员运行：退回写 `HKCU`
-3. 清理图标缓存（`IconCache.db`、`iconcache_*.db`、`thumbcache_*.db`）
-4. 重启 `explorer.exe` 让改动立即生效
-
-**`-Action Restore`**
-
-1. 删除 `HKLM` / `HKCU` 下的值 `29`
-2. 清理图标缓存
-3. 重启 `explorer.exe`
-
-每次运行都会在同目录写 `ShortcutArrow.log`，排查问题看它。
-
----
-
-## 常见问题
-
-**Q：跑完了箭头还在？**
-
-大概率是注册表没写进去。看 `ShortcutArrow.log` 里有没有
-`FAIL ... not writable`。确认是用**管理员**运行的。
-
-**Q：重启电脑后箭头又回来了？**
-
-说明注册表里的图标路径失效了（比如你把 `blank.ico` 删了）。
-重新运行一次 `Remove-ShortcutArrow.bat` 即可。
-
-**Q：Windows 大版本更新后箭头回来了？**
-
-系统更新有时会重置这个注册表项，重新运行脚本。
-
-**Q：去掉箭头后分不清哪个是快捷方式了？**
-
-这是必然的 —— 箭头没了就和真实文件长得一样。
-如果你想要的是「更好看」而不是「完全消失」，可以把注册表值 `29`
-指向一个你自己设计的浅色小箭头图标，做法的其余部分完全一样。
-
-**Q：杀毒软件报警？**
-
-脚本会「改注册表 + 重启 explorer」，行为上像恶意软件。
-代码全部可读（就一个 `.ps1`），放行即可。
-
----
-
-## 手动恢复（脚本跑不了时）
-
-按 `Win+R` 输入 `regedit`，定位到：
-
-```
-HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Icons
-```
-
-删掉右侧名为 `29` 的字符串值，并检查 `HKEY_CURRENT_USER` 下的同一路径。
-然后重启电脑（或注销再登录）。
-
----
-
-## English
-
-**Remove the shortcut arrow overlay on Windows 10 / 11 — the safe way.**
-
-Most guides tell you to delete the `IsShortcut` value under
-`HKEY_CLASSES_ROOT\lnkfile`. That does hide the arrow, but it makes Windows stop
-treating `.lnk` as a shortcut, which breaks **Pin to taskbar**, **Pin to Start**,
-taskbar drag & drop, and can make shortcuts fail to launch with
-*"This file does not have an app associated with it"*.
-
-This project instead **overrides the shortcut overlay icon**
-(`Shell Icons` value `29`) with a fully transparent `.ico` that the script
-generates on the fly. `IsShortcut` is never touched, so all shortcut behaviour
-stays intact.
-
-**Usage**
-
-```powershell
-# remove the arrow (run as Administrator)
-powershell -NoProfile -ExecutionPolicy Bypass -File .\ShortcutArrow.ps1 -Action Remove
-
-# put it back
-powershell -NoProfile -ExecutionPolicy Bypass -File .\ShortcutArrow.ps1 -Action Restore
-```
-
-Or just double-click `Remove-ShortcutArrow.bat` / `Restore-ShortcutArrow.bat`.
-
-The transparent icon is written to `%LOCALAPPDATA%\ShortcutArrow\blank.ico`
-(not next to the script) so that moving the script folder does not break the
-absolute path stored in the registry.
-
-Requires Administrator. Tested on Windows 11 build 26200.
+| `-UseSystemIcon` | 用系统自带空白图标 `imageres.dll,195`，不生成 .ico |
+| `-NoRestart` | 不重启 explorer，下次重启后生效 |
 
 ---
 
 ## License
 
-MIT —— 见 [LICENSE](LICENSE)。
+[MIT](LICENSE)
