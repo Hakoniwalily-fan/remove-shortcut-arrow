@@ -141,6 +141,17 @@ This script stores it at a stable location instead:
 - Without admin the script still runs and falls back to `HKEY_CURRENT_USER`,
   and says so in the log
 
+#### Verified on real hardware
+
+| Build | Arrow (slot `29`) | UAC shield (slot `77`) | `IsShortcut` |
+|---|---|---|---|
+| Windows 11 25H2, build 26200 | ✅ confirmed gone | ✅ confirmed gone | untouched |
+
+Both overlays were applied on a live machine and visually confirmed to
+disappear after the Explorer restart. Afterwards the registry was re-read and
+`HKEY_CLASSES_ROOT\lnkfile\IsShortcut` was verified to be exactly as Windows
+ships it — no shortcut behaviour was altered.
+
 ---
 
 ### Usage
@@ -377,6 +388,16 @@ HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Icon
 > `shell32.dll,50` 与 `imageres.dll,195` 在 Windows 11 build 26200 上实测均为完全透明
 > （`Alpha = 0`）。图标索引可能随 Windows 版本变动，所以默认走「自己生成 .ico」这条
 > 更确定的路——它不可能指向错误的图标。
+
+### 真机实测验证
+
+| 系统版本 | 小箭头（槽位 `29`） | UAC 盾牌（槽位 `77`） | `IsShortcut` |
+|---|---|---|---|
+| Windows 11 25H2 build 26200 | ✅ 确认消失 | ✅ 确认消失 | 未被修改 |
+
+两个覆盖层都在真机上实际应用，重启 explorer 后**肉眼确认消失**。事后重新读取注册表核对，
+`HKEY_CLASSES_ROOT\lnkfile\IsShortcut` 与 Windows 出厂状态完全一致——没有任何快捷方式
+行为被改变。
 
 ### 恢复行为说明
 
