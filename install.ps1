@@ -9,12 +9,16 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet('Remove', 'Restore')]
+    [ValidateSet('Remove', 'Restore', 'Verify')]
     [string]$Action = 'Remove',
 
     # Also hide the UAC shield overlay (Shell Icons value 77).
     # Opt-in: the shield is a warning indicator, so it is never hidden by default.
     [switch]$IncludeShield,
+
+    # Regenerate the transparent icon even if it already exists. Useful after
+    # installing a version that wrote the old 32bpp format.
+    [switch]$Force,
 
     [switch]$NoRestart
 )
@@ -27,7 +31,7 @@ $BaseUrl = 'https://raw.githubusercontent.com/' + $Repo + '/' + $Branch
 $ScriptName = 'ShortcutArrow.ps1'
 $DestDir = Join-Path $env:LOCALAPPDATA 'ShortcutArrow'
 $Target  = Join-Path $DestDir $ScriptName
-$BatFiles = @('Remove-ShortcutArrow.bat', 'Remove-ArrowAndShield.bat', 'Restore-ShortcutArrow.bat')
+$BatFiles = @('Remove-ShortcutArrow.bat', 'Remove-ArrowAndShield.bat', 'Restore-ShortcutArrow.bat', 'Verify-ShortcutArrow.bat')
 
 function Test-IsAdmin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -98,7 +102,8 @@ foreach ($bat in $BatFiles) {
 }
 
 # ----------------------------------------------------------------- 2. elevate
-if (-not (Test-IsAdmin)) {
+# Verify is read-only, so it needs no elevation and must not raise a UAC prompt.
+if ((-not (Test-IsAdmin)) -and ($Action -ne 'Verify')) {
     Write-Host ''
     Write-Host '  Administrator rights are required for a machine-wide change.' -ForegroundColor Yellow
     Write-Host '  Requesting elevation - approve the UAC prompt to continue.'
@@ -111,6 +116,7 @@ if (-not (Test-IsAdmin)) {
     )
     if ($IncludeShield) { $argList += '-IncludeShield' }
     if ($NoRestart)     { $argList += '-NoRestart' }
+    if ($Force)         { $argList += '-Force' }
     try {
         Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $argList | Out-Null
     } catch {
@@ -125,4 +131,5 @@ Write-Host ''
 $forward = @('-Action', $Action)
 if ($IncludeShield) { $forward += '-IncludeShield' }
 if ($NoRestart)     { $forward += '-NoRestart' }
+if ($Force)         { $forward += '-Force' }
 & $Target @forward

@@ -29,6 +29,28 @@ draws nothing.
 
 Nothing else is modified. `IsShortcut` is never touched.
 
+### ⚠️ If every shortcut turned into a black square
+
+Some systems composite a **fully transparent 32bpp overlay as opaque black**,
+painting a solid black square over the *entire* shortcut icon instead of hiding
+a small arrow. This was reproduced first-hand (see
+[verified on real hardware](#verified-on-real-hardware)) and is the reason
+**v1.3.0 generates 1bpp icons instead**.
+
+| | |
+|---|---|
+| Symptom | Every shortcut becomes a black square; folders, documents and image icons stay normal |
+| Why only shortcuts | They are the only icons that get an overlay painted on top of them |
+| Why it is not the icon file | The icon data is correct — it is the *compositing* that goes wrong |
+| Fix | Update and re-run; the 1bpp icon is generated and verified automatically |
+
+**Already affected?** Run `-Action Remove` again. The script re-checks the
+existing `blank.ico` on every run and regenerates it when it is still in the old
+32bpp format. v1.2.0 and earlier only wrote that file when it was missing, so
+re-running the old version could never repair an affected machine.
+
+Want out immediately instead? `-Action Restore` puts the stock arrow back.
+
 ### One-line install
 
 Open **PowerShell as Administrator**:
@@ -47,6 +69,12 @@ Restore everything (both overlays):
 
 ```powershell
 & "$env:LOCALAPPDATA\ShortcutArrow\ShortcutArrow.ps1" -Action Restore
+```
+
+Check what is installed right now (read-only, changes nothing):
+
+```powershell
+& "$env:LOCALAPPDATA\ShortcutArrow\ShortcutArrow.ps1" -Action Verify
 ```
 
 Prefer no one-liner? Grab the [latest release](https://github.com/Hakoniwalily-fan/remove-shortcut-arrow/releases/latest)
@@ -114,9 +142,25 @@ HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Icon
 Point a slot at a **fully transparent icon** and the overlay is still painted —
 it just paints nothing.
 
-The script builds that transparent `.ico` from scratch at runtime (16 / 32 / 48
-px, hand-assembled ICO binary, every pixel `Alpha = 0`). No bundled binary, no
-downloaded asset, nothing to trust.
+The script builds that transparent `.ico` from scratch at runtime — no bundled
+binary, no downloaded asset, nothing to trust.
+
+#### Why the icon is 1bpp (and not the obvious 32bpp)
+
+The intuitive way to build "nothing" is a 32bpp image whose pixels are all
+`BGRA 0,0,0,0`. That is what v1.2.0 did, and it is correct on paper — but on
+affected systems the alpha channel is not honoured for this overlay and the
+pixels are composited as **opaque black**, covering the whole icon.
+
+v1.3.0 therefore writes **1bpp images with an all-ones AND mask**. A 1bpp image
+has no alpha channel at all: "leave the screen unchanged" is expressed purely by
+the mask, so there is no alpha path left for a compositor to get wrong. Ten
+sizes are included (16 / 20 / 24 / 32 / 40 / 48 / 64 / 96 / 128 / 256) so
+Explorer never has to scale one image into a different size.
+
+Before the registry is touched, the generated file is parsed as an ICO and
+loaded back through the shell's own icon API; the run aborts if the result is
+not a safe, fully transparent icon.
 
 #### Why the icon lives in `%LOCALAPPDATA%`
 
@@ -143,14 +187,23 @@ This script stores it at a stable location instead:
 
 #### Verified on real hardware
 
-| Build | Arrow (slot `29`) | UAC shield (slot `77`) | `IsShortcut` |
-|---|---|---|---|
-| Windows 11 25H2, build 26200 | ✅ confirmed gone | ✅ confirmed gone | untouched |
+| Machine | Icon format | Result |
+|---|---|---|
+| Windows 11 25H2 build 26200, Intel iGPU + NVIDIA dGPU laptop | 32bpp, `Alpha = 0` (v1.2.0) | ❌ **every shortcut rendered as a solid black square** |
+| same machine, same registry slots, fresh icon cache | **1bpp, AND mask all ones (v1.3.0)** | ✅ overlay invisible, icons untouched |
 
-Both overlays were applied on a live machine and visually confirmed to
-disappear after the Explorer restart. Afterwards the registry was re-read and
-`HKEY_CLASSES_ROOT\lnkfile\IsShortcut` was verified to be exactly as Windows
-ships it — no shortcut behaviour was altered.
+The failing run was measured from a screenshot: 32 identical pure-black 32×32
+squares, one per shortcut, on a white wallpaper. Extracting those shortcuts'
+icons through the shell API returned the correct colourful icons — which is what
+pinned the fault to the overlay composite rather than the icon data. Deleting
+the two registry slots made the squares disappear instantly, and reinstalling
+them with the 1bpp icon kept them away. Rebuilding the icon cache alone did not
+help, and the built-in `shell32.dll,50` icon is 32bpp, so it is in the same
+risky class.
+
+On the same machine both overlays were also confirmed to vanish (arrow **and**
+shield), and afterwards the registry was re-read: `HKEY_CLASSES_ROOT\lnkfile\IsShortcut`
+matched a stock Windows install exactly — no shortcut behaviour was altered.
 
 ---
 
@@ -163,7 +216,8 @@ irm https://raw.githubusercontent.com/Hakoniwalily-fan/remove-shortcut-arrow/mai
 ```
 
 `install.ps1` downloads the current script into `%LOCALAPPDATA%\ShortcutArrow\`
-and re-launches itself elevated if needed.
+and re-launches itself elevated if needed. `-Action Verify` is read-only and
+therefore never raises a UAC prompt.
 
 #### Straight from a clone
 
@@ -171,6 +225,7 @@ and re-launches itself elevated if needed.
 .\ShortcutArrow.ps1 -Action Remove                    # arrow only
 .\ShortcutArrow.ps1 -Action Remove -IncludeShield     # arrow + shield
 .\ShortcutArrow.ps1 -Action Restore                   # restore both
+.\ShortcutArrow.ps1 -Action Verify                    # diagnose, read-only
 ```
 
 #### Double-click
@@ -180,6 +235,7 @@ and re-launches itself elevated if needed.
 | `Remove-ShortcutArrow.bat` | removes the arrow only |
 | `Remove-ArrowAndShield.bat` | removes the arrow **and** the UAC shield |
 | `Restore-ShortcutArrow.bat` | restores both overlays |
+| `Verify-ShortcutArrow.bat` | read-only diagnostic — changes nothing |
 
 #### Options
 
@@ -187,14 +243,21 @@ and re-launches itself elevated if needed.
 |---|---|
 | `-Action Remove` | hide the arrow (default) |
 | `-Action Restore` | restore the arrow **and** the shield |
+| `-Action Verify` | read-only: report what is applied and whether the icon is safe |
 | `-IncludeShield` | also hide the UAC shield overlay (slot `77`) |
-| `-UseSystemIcon` | use the built-in blank icon `shell32.dll,50` instead of generating a `.ico` |
+| `-IconFormat Mask1bpp` | default: 1bpp mask-based transparency (safe on every system seen so far) |
+| `-IconFormat Legacy32bpp` | the pre-1.3.0 format — see the black square warning above |
+| `-Force` | regenerate the transparent icon even if it already exists |
+| `-UseSystemIcon` | **deprecated** — `shell32.dll,50` is a 32bpp icon, i.e. the risky format class |
 | `-NoRestart` | don't restart Explorer; takes effect after the next restart |
 
 > `shell32.dll,50` and `imageres.dll,195` were both measured as fully
-> transparent (`Alpha = 0`) on Windows 11 build 26200. Icon indices can shift
-> between Windows versions, which is why the default is the self-generated
-> `.ico` — that can never point at the wrong icon.
+> transparent (`Alpha = 0`) on Windows 11 build 26200. But they are 32bpp icons:
+> the exact format class that can render as an opaque black square over the whole
+> icon. `-UseSystemIcon` is kept for backwards compatibility only, prints a
+> warning, and is not the recommended path. Icon indices can also shift between
+> Windows versions, so the self-generated `.ico` can never point at the wrong
+> icon either.
 
 ---
 
@@ -203,10 +266,13 @@ and re-launches itself elevated if needed.
 **`-Action Remove`**
 
 1. Generates a fully transparent `blank.ico` in `%LOCALAPPDATA%\ShortcutArrow\`
-   (skipped if it already exists)
+   — 1bpp, ten sizes, verified before use. An existing file is re-checked on
+   every run and regenerated when it is not in the requested format; `-Force`
+   always regenerates
 2. Sets `Shell Icons` slot `29` — and slot `77` too with `-IncludeShield`
    - elevated → `HKLM` (documented location, machine-wide)
    - not elevated → falls back to `HKCU`
+   - every write is read back and compared, so a silent failure is reported
 3. Clears the icon cache (`IconCache.db`, `iconcache_*.db`, `thumbcache_*.db`)
 4. Restarts `explorer.exe`
 
@@ -216,12 +282,22 @@ and re-launches itself elevated if needed.
 2. Clears the icon cache
 3. Restarts `explorer.exe`
 
+**`-Action Verify`**
+
+Read-only. For every slot in `HKLM` and `HKCU` it prints the value, resolves the
+icon it points at, checks the file exists, reads the real format out of the ICO
+header, and loads the icon back through the shell API. It exits with a non-zero
+code when a slot points at a missing file, at a 32bpp icon, or at anything that
+fails verification. Useful when the arrow "came back" or when shortcuts look
+wrong.
+
 Restore always clears both slots, even if you never hid the shield. A hidden
 security indicator should never be able to linger just because a flag was
 forgotten. Each removed value is written to the log with its previous content,
 so a custom replacement icon can be put back by hand.
 
-Every run appends to `ShortcutArrow.log` next to the script.
+Every run appends to `ShortcutArrow.log` next to the script. The log also records
+the generated icon's size, detected format, size list and SHA-256.
 
 ---
 
@@ -230,6 +306,16 @@ Every run appends to `ShortcutArrow.log` next to the script.
 **The overlay is still there.**
 Check `ShortcutArrow.log` for `FAIL ... not writable`. You almost certainly ran
 it without Administrator rights.
+
+**Every shortcut turned into a black square.**
+That is the 32bpp composite bug described at the top of this page. Run
+`-Action Restore` immediately to get the stock arrow back, then update and run
+`-Action Remove` again — v1.3.0 writes the 1bpp icon and re-checks the existing
+file, so it repairs itself. `-Action Verify` prints which format is installed.
+
+**How do I check what is installed right now?**
+`-Action Verify`, or double-click `Verify-ShortcutArrow.bat`. Nothing is
+modified except the log.
 
 **It came back after a reboot.**
 The icon path in the registry went stale — usually because `blank.ico` was
@@ -284,6 +370,25 @@ path under `HKEY_CURRENT_USER` too. Then reboot.
 
 除了这两个覆盖层，脚本不改动任何东西，**完全不碰 `IsShortcut`**。
 
+### ⚠️ 如果所有快捷方式都变成了黑色方块
+
+部分系统会把**「全透明的 32bpp 覆盖层」当成不透明黑色来合成**——结果不是遮住一个小箭头，
+而是**整张快捷方式图标被盖成一个纯黑方块**。这个问题已真机复现（见
+[真机实测验证](#真机实测验证)），也正是 **v1.3.0 改用 1bpp 图标**的原因。
+
+| | |
+|---|---|
+| 现象 | 所有快捷方式变成黑方块；文件夹、文档、图片图标正常 |
+| 为什么只有快捷方式 | 只有快捷方式会被额外叠加一层覆盖图标 |
+| 为什么不是图标文件的问题 | 图标数据本身是正确的，出错的是**合成那一步** |
+| 怎么修 | 更新后重跑一次，1bpp 图标会自动生成并自检 |
+
+**已经中招了怎么办？** 直接重跑 `-Action Remove`。脚本每次都会重新检查已有的
+`blank.ico`，只要它还是旧的 32bpp 格式就会重新生成。**v1.2.0 及更早版本只在文件不存在
+时才生成，所以老版本重跑多少次都修不好。**
+
+想立刻摆脱黑方块：跑 `-Action Restore`，小箭头会马上回来。
+
 ### 一行安装
 
 以**管理员身份**打开 PowerShell：
@@ -302,6 +407,12 @@ irm https://raw.githubusercontent.com/Hakoniwalily-fan/remove-shortcut-arrow/mai
 
 ```powershell
 & "$env:LOCALAPPDATA\ShortcutArrow\ShortcutArrow.ps1" -Action Restore
+```
+
+查看当前装的是什么（只读，不改任何东西）：
+
+```powershell
+& "$env:LOCALAPPDATA\ShortcutArrow\ShortcutArrow.ps1" -Action Verify
 ```
 
 ### ⚠️ 关于小盾牌——请先读这段
@@ -355,8 +466,20 @@ HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Icon
 
 指向一个**全透明图标**，覆盖层照画，只是画出来什么都没有。
 
-脚本在运行时**自己拼出**这个透明 `.ico`（16 / 32 / 48 三种尺寸，逐像素 `Alpha = 0`），
-不依赖任何预置文件。
+脚本在运行时**自己拼出**这个透明 `.ico`，不依赖任何预置文件。
+
+#### 为什么用 1bpp，而不是"看起来更正常"的 32bpp
+
+最直觉的做法是造一张 32bpp、像素全为 `BGRA 0,0,0,0` 的图。v1.2.0 就是这么做的，
+理论上完全正确——但在部分系统上，这个覆盖层的 alpha 通道**不会被遵守**，像素会被当成
+**不透明黑**合成，把整张图标盖住。
+
+所以 v1.3.0 改为写 **1bpp 图像 + 全 1 的 AND 掩码**。1bpp 图像**根本没有 alpha 通道**：
+「保持屏幕不变」完全由掩码表达，合成器没有 alpha 可走错。同时补齐 **10 个尺寸**
+（16 / 20 / 24 / 32 / 40 / 48 / 64 / 96 / 128 / 256），避免系统把某一张缩放成别的尺寸。
+
+在真正写注册表之前，脚本会把生成的文件按 ICO 格式解析一遍，并通过系统自带的图标 API
+读回来检查；不达标就**中止**，注册表一点都不动。
 
 ### 图标为什么放在 `%LOCALAPPDATA%`
 
@@ -369,11 +492,12 @@ HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Icon
 
 | 文件 | 用途 |
 |---|---|
-| `install.ps1` | 一行安装入口，自动处理提权 |
-| `ShortcutArrow.ps1` | 主脚本（Remove / Restore） |
+| `install.ps1` | 一行安装入口，自动处理提权（`Verify` 只读，不会弹 UAC） |
+| `ShortcutArrow.ps1` | 主脚本（Remove / Restore / Verify） |
 | `Remove-ShortcutArrow.bat` | 双击去小箭头 |
 | `Remove-ArrowAndShield.bat` | 双击去小箭头 + 小盾牌 |
 | `Restore-ShortcutArrow.bat` | 双击恢复（两个都还原） |
+| `Verify-ShortcutArrow.bat` | 双击诊断（只读，不改任何东西） |
 
 ### 参数
 
@@ -381,21 +505,33 @@ HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Icon
 |---|---|
 | `-Action Remove` | 去掉小箭头（默认） |
 | `-Action Restore` | 恢复小箭头**和**小盾牌 |
+| `-Action Verify` | 只读诊断：当前装了什么、图标格式是否安全 |
 | `-IncludeShield` | 同时隐藏 UAC 盾牌覆盖层（槽位 `77`） |
-| `-UseSystemIcon` | 用系统自带空白图标 `shell32.dll,50`，不生成 .ico |
+| `-IconFormat Mask1bpp` | 默认：1bpp 掩码透明（目前见过的系统上都安全） |
+| `-IconFormat Legacy32bpp` | v1.3.0 之前的旧格式——见上面的黑方块警告 |
+| `-Force` | 即使图标已存在也强制重新生成 |
+| `-UseSystemIcon` | **已弃用**——`shell32.dll,50` 是 32bpp 图标，属于有风险的格式类别 |
 | `-NoRestart` | 不重启 explorer，下次重启后生效 |
 
 > `shell32.dll,50` 与 `imageres.dll,195` 在 Windows 11 build 26200 上实测均为完全透明
-> （`Alpha = 0`）。图标索引可能随 Windows 版本变动，所以默认走「自己生成 .ico」这条
-> 更确定的路——它不可能指向错误的图标。
+> （`Alpha = 0`），但它们都是 **32bpp** —— 正是可能被渲染成整张纯黑方块的那一类格式。
+> 因此 `-UseSystemIcon` 仅为兼容旧用法而保留，运行时会打印警告，不是推荐路径。此外图标
+> 索引可能随 Windows 版本变动，而自己生成的 `.ico` 不可能指向错误的图标。
 
 ### 真机实测验证
 
-| 系统版本 | 小箭头（槽位 `29`） | UAC 盾牌（槽位 `77`） | `IsShortcut` |
-|---|---|---|---|
-| Windows 11 25H2 build 26200 | ✅ 确认消失 | ✅ 确认消失 | 未被修改 |
+| 机器 | 图标格式 | 结果 |
+|---|---|---|
+| Windows 11 25H2 build 26200，Intel 核显 + NVIDIA 独显笔记本 | 32bpp，`Alpha = 0`（v1.2.0） | ❌ **所有快捷方式被渲染成纯黑方块** |
+| 同一台机器、同样的注册表槽位、全新图标缓存 | **1bpp，AND 掩码全 1（v1.3.0）** | ✅ 覆盖层不可见，图标完好 |
 
-两个覆盖层都在真机上实际应用，重启 explorer 后**肉眼确认消失**。事后重新读取注册表核对，
+失败的那次是从截图里量出来的：白色壁纸上 **32 个完全相同的纯黑 32×32 方块**，一个快捷
+方式一个。通过系统 API 提取这些快捷方式的图标，拿到的却是完全正常的彩色图标——正是这
+一点把故障定位到**覆盖层合成**而不是图标数据。删掉那两个注册表槽位，黑块立刻消失；
+装回 1bpp 图标后黑块不再出现。单纯重建图标缓存**没有用**，而系统自带的 `shell32.dll,50`
+也是 32bpp，同样属于有风险的格式。
+
+同一台机器上两个覆盖层（小箭头**和**小盾牌）也都确认消失，事后重新读取注册表核对，
 `HKEY_CLASSES_ROOT\lnkfile\IsShortcut` 与 Windows 出厂状态完全一致——没有任何快捷方式
 行为被改变。
 
@@ -404,6 +540,9 @@ HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Icon
 `-Action Restore` **总是同时清除 `29` 和 `77` 两个槽位**，即使你从没隐藏过盾牌。
 理由是：一个被隐藏的安全提示不应该因为「忘了加参数」而残留。每个被删除的值都会连同
 它原来的内容写进日志，方便你手工把自定义图标放回去。
+
+每次运行都会往脚本旁边的 `ShortcutArrow.log` 追加记录，其中包含生成图标的字节数、
+检测到的格式、尺寸列表和 SHA-256。
 
 ---
 
