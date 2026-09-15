@@ -31,23 +31,37 @@ Nothing else is modified. `IsShortcut` is never touched.
 
 ### ⚠️ If every shortcut turned into a black square
 
-Some systems composite a **fully transparent 32bpp overlay as opaque black**,
-painting a solid black square over the *entire* shortcut icon instead of hiding
-a small arrow. This was reproduced first-hand (see
-[verified on real hardware](#verified-on-real-hardware)) and is the reason
-**v1.3.0 generates 1bpp icons instead**.
+An **empty** overlay icon — one with no opaque or semi-opaque pixels at all — is
+composited as an **opaque black square** over the *entire* shortcut icon on some
+systems, instead of hiding a small arrow.
 
-| | |
+This is **not** about the pixel format. Measured on the affected machine
+(Windows 11 25H2 build 26200, Intel iGPU + NVIDIA dGPU), with the registry
+slots, the icon path and the icon cache all held constant:
+
+| Overlay icon | Ink (pixels with alpha > 0) | Result |
+|---|---|---|
+| 1bpp, AND mask all ones (v1.3.0's "fix") | 0 | ❌ every shortcut = a black square |
+| 32bpp, every pixel `BGRA 0,0,0,0` (v1.2.0) | 0 | ❌ every shortcut = a black square |
+| 32bpp, one pixel at `alpha = 2/255` (v1.4.0) | 1 per size | ✅ overlay invisible, icons untouched |
+
+The variable is **"is the icon empty"**. A 1bpp image cannot express "almost
+empty": it can only be completely empty or show an opaque black pixel — which is
+why v1.3.0's 1bpp rewrite still blackened every icon. v1.4.0 therefore writes a
+32bpp icon with a single `alpha = 2/255` pixel (0.8% opacity, invisible to the
+eye) and an AND mask that matches it.
+
+Two other suspects were ruled out by measurement rather than by argument:
+
+| Hypothesis | Result |
 |---|---|
-| Symptom | Every shortcut becomes a black square; folders, documents and image icons stay normal |
-| Why only shortcuts | They are the only icons that get an overlay painted on top of them |
-| Why it is not the icon file | The icon data is correct — it is the *compositing* that goes wrong |
-| Fix | Update and re-run; the 1bpp icon is generated and verified automatically |
+| The icon path matters (non-ASCII `%LOCALAPPDATA%`) | ❌ not a factor — an ASCII path with the same empty icon blackens identically |
+| The bit depth matters | ❌ not a factor |
 
-**Already affected?** Run `-Action Remove` again. The script re-checks the
-existing `blank.ico` on every run and regenerates it when it is still in the old
-32bpp format. v1.2.0 and earlier only wrote that file when it was missing, so
-re-running the old version could never repair an affected machine.
+**Already affected?** Update and re-run `-Action Remove`. v1.4.0 checks the
+existing `blank.ico` on every run, and a completely empty icon now fails
+verification and gets regenerated. v1.3.0 wrote a *different* empty icon, so
+simply re-running it could never repair anything.
 
 Want out immediately instead? `-Action Restore` puts the stock arrow back.
 
@@ -145,22 +159,23 @@ it just paints nothing.
 The script builds that transparent `.ico` from scratch at runtime — no bundled
 binary, no downloaded asset, nothing to trust.
 
-#### Why the icon is 1bpp (and not the obvious 32bpp)
+#### Why the icon is 32bpp but almost empty
 
 The intuitive way to build "nothing" is a 32bpp image whose pixels are all
-`BGRA 0,0,0,0`. That is what v1.2.0 did, and it is correct on paper — but on
-affected systems the alpha channel is not honoured for this overlay and the
-pixels are composited as **opaque black**, covering the whole icon.
+`BGRA 0,0,0,0`. That is what v1.2.0 did. v1.3.0 replaced it with 1bpp images —
+and **both are completely empty**, which is precisely the condition that gets
+composited as an opaque black square (see the table at the top of this page).
 
-v1.3.0 therefore writes **1bpp images with an all-ones AND mask**. A 1bpp image
-has no alpha channel at all: "leave the screen unchanged" is expressed purely by
-the mask, so there is no alpha path left for a compositor to get wrong. Ten
-sizes are included (16 / 20 / 24 / 32 / 40 / 48 / 64 / 96 / 128 / 256) so
-Explorer never has to scale one image into a different size.
+v1.4.0 writes **32bpp images in which every pixel is transparent except one**, at
+`alpha = 2/255`, with the AND-mask bit cleared for that pixel. Ten sizes are
+included (16 / 20 / 24 / 32 / 40 / 48 / 64 / 96 / 128 / 256) so Explorer never
+has to scale one image into a different size.
 
-Before the registry is touched, the generated file is parsed as an ICO and
-loaded back through the shell's own icon API; the run aborts if the result is
-not a safe, fully transparent icon.
+Before the registry is touched, the file is parsed straight from its bytes
+(`Get-IcoContent`), which counts the ink pixels and checks that the AND mask
+agrees with them. An empty icon, an icon containing opaque black pixels, or an
+icon whose mask contradicts its ink all abort the run with the registry
+untouched.
 
 #### Why the icon lives in `%LOCALAPPDATA%`
 
@@ -187,23 +202,40 @@ This script stores it at a stable location instead:
 
 #### Verified on real hardware
 
-| Machine | Icon format | Result |
-|---|---|---|
-| Windows 11 25H2 build 26200, Intel iGPU + NVIDIA dGPU laptop | 32bpp, `Alpha = 0` (v1.2.0) | ❌ **every shortcut rendered as a solid black square** |
-| same machine, same registry slots, fresh icon cache | **1bpp, AND mask all ones (v1.3.0)** | ✅ overlay invisible, icons untouched |
+Windows 11 25H2 build 26200, Intel iGPU + NVIDIA dGPU laptop, 15 desktop
+shortcuts. Every result below was measured through the shell's own icon API
+(`ExtractAssociatedIcon`), counting the opaque-black pixels of each shortcut's
+icon.
 
-The failing run was measured from a screenshot: 32 identical pure-black 32×32
-squares, one per shortcut, on a white wallpaper. Extracting those shortcuts'
-icons through the shell API returned the correct colourful icons — which is what
-pinned the fault to the overlay composite rather than the icon data. Deleting
-the two registry slots made the squares disappear instantly, and reinstalling
-them with the 1bpp icon kept them away. Rebuilding the icon cache alone did not
-help, and the built-in `shell32.dll,50` icon is 32bpp, so it is in the same
-risky class.
+| Configuration | Ink | Measured |
+|---|---|---|
+| No overlay registered | n/a | ✅ normal (worst 31.9%) |
+| 32bpp, `alpha = 0`, 10 sizes (v1.2.0) | 0 | ❌ 100% — every shortcut a black square |
+| 1bpp, AND mask all ones, 10 sizes (v1.3.0) | 0 | ❌ 100% — every shortcut a black square |
+| the same empty icon on an ASCII path | 0 | ❌ 100% (so the path is **not** the factor) |
+| 32bpp, one pixel at `alpha = 2/255` (v1.4.0) | 1 | ✅ normal (worst 31.9%) |
+
+Two measurement traps turned up while building this, and v1.4.0 handles both:
+
+1. **The process that makes the change cannot see the result.** With an empty
+   overlay installed, the script's own process reported 38% ("fine") at t+5s
+   through t+60s, while a freshly started process reported 100% at the very same
+   moments. The end-to-end check therefore runs in a **child process**.
+2. **The shell can serve stale composites for a moment** right after the
+   registry change and the cache clear. The check samples over a short window
+   and lets the worst reading decide. In the regression test the first
+   observation read 38% and the second read 100% — which is what triggers the
+   automatic rollback.
+
+The v1.3.0 verification inspected only the icon *file's format*, found nothing
+wrong, and printed `no problems found` while every shortcut on the desktop was a
+black square. That specific failure is what the new end-to-end check exists to
+prevent.
 
 On the same machine both overlays were also confirmed to vanish (arrow **and**
-shield), and afterwards the registry was re-read: `HKEY_CLASSES_ROOT\lnkfile\IsShortcut`
-matched a stock Windows install exactly — no shortcut behaviour was altered.
+shield), and afterwards the registry was re-read:
+`HKEY_CLASSES_ROOT\lnkfile\IsShortcut` matched a stock Windows install exactly —
+no shortcut behaviour was altered.
 
 ---
 
@@ -243,21 +275,38 @@ therefore never raises a UAC prompt.
 |---|---|
 | `-Action Remove` | hide the arrow (default) |
 | `-Action Restore` | restore the arrow **and** the shield |
-| `-Action Verify` | read-only: report what is applied and whether the icon is safe |
+| `-Action Verify` | read-only: report what is applied, inspect the icon, and measure the actual desktop |
 | `-IncludeShield` | also hide the UAC shield overlay (slot `77`) |
-| `-IconFormat Mask1bpp` | default: 1bpp mask-based transparency (safe on every system seen so far) |
-| `-IconFormat Legacy32bpp` | the pre-1.3.0 format — see the black square warning above |
+| `-IconFormat Faint32bpp` | default, and the only safe class: 32bpp with a single `alpha = 2/255` pixel |
+| `-IconFormat Empty1bpp` | the v1.3.0 icon — completely empty; `-Action Remove` refuses it |
+| `-IconFormat Empty32bpp` | the v1.2.0 icon — same defect, same refusal |
+| `-IconFormat Mask1bpp` / `Legacy32bpp` | accepted aliases for the two `Empty*` classes |
 | `-Force` | regenerate the transparent icon even if it already exists |
-| `-UseSystemIcon` | **deprecated** — `shell32.dll,50` is a 32bpp icon, i.e. the risky format class |
+| `-UseSystemIcon` | **deprecated** — `shell32.dll,50` is itself a fully transparent (empty) icon |
 | `-NoRestart` | don't restart Explorer; takes effect after the next restart |
 
-> `shell32.dll,50` and `imageres.dll,195` were both measured as fully
-> transparent (`Alpha = 0`) on Windows 11 build 26200. But they are 32bpp icons:
-> the exact format class that can render as an opaque black square over the whole
-> icon. `-UseSystemIcon` is kept for backwards compatibility only, prints a
-> warning, and is not the recommended path. Icon indices can also shift between
-> Windows versions, so the self-generated `.ico` can never point at the wrong
-> icon either.
+> The two `Empty*` formats exist so the failure stays reproducible (the test
+> suite uses them) and so old command lines keep parsing — but `-Action Remove`
+> now **aborts** on them instead of installing an icon that is known to blacken
+> every shortcut. To reproduce the broken state deliberately, generate the icon
+> with `New-TransparentIco -Format Empty32bpp` and register it by hand.
+>
+> `shell32.dll,50` and `imageres.dll,195` are fully transparent, i.e. **empty**,
+> which puts them in the same risky class. `-UseSystemIcon` is kept only for
+> backwards compatibility, prints a warning, and is not the recommended path.
+> Icon indices can also shift between Windows versions, whereas the
+> self-generated `.ico` can never point at the wrong icon.
+
+#### Tests
+
+```powershell
+pwsh -File tests/Test-ShortcutArrow.ps1           # PowerShell 7
+powershell -File tests\Test-ShortcutArrow.ps1     # Windows PowerShell 5.1
+```
+
+The suite pins the contract this bug broke: the generated icon must **not** be
+empty, its ink must stay faint (no opaque pixels), its AND mask must agree with
+its ink, and the validator must reject both legacy empty formats.
 
 ---
 
@@ -265,31 +314,38 @@ therefore never raises a UAC prompt.
 
 **`-Action Remove`**
 
-1. Generates a fully transparent `blank.ico` in `%LOCALAPPDATA%\ShortcutArrow\`
-   — 1bpp, ten sizes, verified before use. An existing file is re-checked on
-   every run and regenerated when it is not in the requested format; `-Force`
-   always regenerates
-2. Sets `Shell Icons` slot `29` — and slot `77` too with `-IncludeShield`
+1. Generates the overlay icon in `%LOCALAPPDATA%\ShortcutArrow\` — 32bpp, ten
+   sizes, one faint ink pixel, parsed and verified before use. An existing file
+   is re-checked on every run and regenerated when it is empty or otherwise
+   fails verification; `-Force` always regenerates
+2. **Stops `explorer.exe`**, then clears the icon cache (`IconCache.db`,
+   `iconcache_*.db`, `thumbcache_*.db`) while the shell is down, and logs how
+   many files were actually deleted. Doing this in the other order deletes
+   nothing (measured: 30 files present, 0 deleted) and leaves the stale
+   composites in place
+3. Sets `Shell Icons` slot `29` — and slot `77` too with `-IncludeShield`
    - elevated → `HKLM` (documented location, machine-wide)
    - not elevated → falls back to `HKCU`
    - every write is read back and compared, so a silent failure is reported
-3. Clears the icon cache (`IconCache.db`, `iconcache_*.db`, `thumbcache_*.db`)
-4. Restarts `explorer.exe`
+4. Starts `explorer.exe`
+5. **Measures the result** — in a child process, sampling over a short window —
+   and rolls the whole change back automatically if any shortcut came out as a
+   black square
 
 **`-Action Restore`**
 
-1. Deletes slots `29` **and** `77` from `HKLM` and `HKCU`
-2. Clears the icon cache
-3. Restarts `explorer.exe`
+1. Stops `explorer.exe` and clears the icon cache (same order as above)
+2. Deletes slots `29` **and** `77` from `HKLM` and `HKCU`
+3. Starts `explorer.exe` and measures the result
 
 **`-Action Verify`**
 
 Read-only. For every slot in `HKLM` and `HKCU` it prints the value, resolves the
-icon it points at, checks the file exists, reads the real format out of the ICO
-header, and loads the icon back through the shell API. It exits with a non-zero
-code when a slot points at a missing file, at a 32bpp icon, or at anything that
-fails verification. Useful when the arrow "came back" or when shortcuts look
-wrong.
+icon it points at, checks that the file exists, counts its ink pixels and checks
+its AND mask — and then measures the desktop itself, in a child process. It exits
+non-zero when a slot points at a missing file, at an empty icon, at anything else
+that fails verification, or when shortcuts are painted black right now. Useful
+when the arrow "came back" or when the desktop looks wrong.
 
 Restore always clears both slots, even if you never hid the shield. A hidden
 security indicator should never be able to linger just because a flag was
@@ -308,10 +364,16 @@ Check `ShortcutArrow.log` for `FAIL ... not writable`. You almost certainly ran
 it without Administrator rights.
 
 **Every shortcut turned into a black square.**
-That is the 32bpp composite bug described at the top of this page. Run
+The registered overlay icon is empty (see the top of this page). Run
 `-Action Restore` immediately to get the stock arrow back, then update and run
-`-Action Remove` again — v1.3.0 writes the 1bpp icon and re-checks the existing
-file, so it repairs itself. `-Action Verify` prints which format is installed.
+`-Action Remove` again — v1.4.0 regenerates the icon and refuses to install an
+empty one. Note that the run which caused this may well have reported success:
+the old check only looked at the file format.
+
+**`-Action Remove` exited non-zero and said it rolled back.**
+That is the new safety net working: the desktop was measured, shortcuts came out
+black, and the change was undone instead of being left in place. Please report it
+with `ShortcutArrow.log` and your Windows build.
 
 **How do I check what is installed right now?**
 `-Action Verify`, or double-click `Verify-ShortcutArrow.bat`. Nothing is
@@ -372,20 +434,33 @@ path under `HKEY_CURRENT_USER` too. Then reboot.
 
 ### ⚠️ 如果所有快捷方式都变成了黑色方块
 
-部分系统会把**「全透明的 32bpp 覆盖层」当成不透明黑色来合成**——结果不是遮住一个小箭头，
-而是**整张快捷方式图标被盖成一个纯黑方块**。这个问题已真机复现（见
-[真机实测验证](#真机实测验证)），也正是 **v1.3.0 改用 1bpp 图标**的原因。
+**「全空」的覆盖层图标**（没有任何不透明或半透明像素）在部分系统上会被合成成**不透明黑色**——
+结果不是遮住一个小箭头，而是**整张快捷方式图标被盖成一个纯黑方块**。
 
-| | |
+这**与像素格式无关**。以下结果在出问题的机器上实测（Windows 11 25H2 build 26200，Intel 核显 +
+NVIDIA 独显），注册表槽位、图标路径、图标缓存全部保持不变：
+
+| 覆盖层图标 | 墨迹（alpha > 0 的像素数） | 结果 |
+|---|---|---|
+| 1bpp，AND 掩码全 1（v1.3.0 的「修复」） | 0 | ❌ 每个快捷方式都是黑方块 |
+| 32bpp，全部像素 `BGRA 0,0,0,0`（v1.2.0） | 0 | ❌ 每个快捷方式都是黑方块 |
+| 32bpp，一个 `alpha = 2/255` 的像素（v1.4.0） | 每个尺寸 1 个 | ✅ 覆盖层不可见，图标完好 |
+
+真正的变量是**「图标是不是全空的」**。1bpp 图像**无法表达「几乎全空」**：它要么完全空，
+要么显示一个不透明的黑像素——这就是 v1.3.0 改成 1bpp 之后**照样全黑**的原因。因此 v1.4.0
+生成的是 32bpp 图标，其中**只有一个 `alpha = 2/255` 的像素**（0.8% 不透明度，肉眼不可见），
+并让 AND 掩码与之一致。
+
+另外两个怀疑对象是靠实测排除的，不是靠推理：
+
+| 怀疑对象 | 结论 |
 |---|---|
-| 现象 | 所有快捷方式变成黑方块；文件夹、文档、图片图标正常 |
-| 为什么只有快捷方式 | 只有快捷方式会被额外叠加一层覆盖图标 |
-| 为什么不是图标文件的问题 | 图标数据本身是正确的，出错的是**合成那一步** |
-| 怎么修 | 更新后重跑一次，1bpp 图标会自动生成并自检 |
+| 图标路径（带中文的 `%LOCALAPPDATA%`） | ❌ 不是原因——同一张全空图标放到纯 ASCII 路径下一样全黑 |
+| 位深 / 格式 | ❌ 不是原因 |
 
-**已经中招了怎么办？** 直接重跑 `-Action Remove`。脚本每次都会重新检查已有的
-`blank.ico`，只要它还是旧的 32bpp 格式就会重新生成。**v1.2.0 及更早版本只在文件不存在
-时才生成，所以老版本重跑多少次都修不好。**
+**已经中招了怎么办？** 更新后重跑 `-Action Remove`。v1.4.0 每次都会重新检查已有的
+`blank.ico`，**全空图标现在会直接校验失败并被重新生成**。v1.3.0 生成的是**另一种同样全空**
+的图标，所以老版本重跑多少次都修不好。
 
 想立刻摆脱黑方块：跑 `-Action Restore`，小箭头会马上回来。
 
@@ -468,18 +543,19 @@ HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Icon
 
 脚本在运行时**自己拼出**这个透明 `.ico`，不依赖任何预置文件。
 
-#### 为什么用 1bpp，而不是"看起来更正常"的 32bpp
+#### 为什么是「32bpp 但几乎全空」
 
-最直觉的做法是造一张 32bpp、像素全为 `BGRA 0,0,0,0` 的图。v1.2.0 就是这么做的，
-理论上完全正确——但在部分系统上，这个覆盖层的 alpha 通道**不会被遵守**，像素会被当成
-**不透明黑**合成，把整张图标盖住。
+最直觉的做法是造一张 32bpp、像素全为 `BGRA 0,0,0,0` 的图。v1.2.0 就是这么做的；
+v1.3.0 把它换成了 1bpp 图——而**两者都是「全空」的**，这恰恰就是会被合成为不透明黑方块的
+那个条件（见本页开头的表格）。
 
-所以 v1.3.0 改为写 **1bpp 图像 + 全 1 的 AND 掩码**。1bpp 图像**根本没有 alpha 通道**：
-「保持屏幕不变」完全由掩码表达，合成器没有 alpha 可走错。同时补齐 **10 个尺寸**
+v1.4.0 生成的是**每个像素都透明、只有一个像素例外**的 32bpp 图：那一个像素的
+`alpha = 2/255`，并把它的 AND 掩码位清 0。同时补齐 **10 个尺寸**
 （16 / 20 / 24 / 32 / 40 / 48 / 64 / 96 / 128 / 256），避免系统把某一张缩放成别的尺寸。
 
-在真正写注册表之前，脚本会把生成的文件按 ICO 格式解析一遍，并通过系统自带的图标 API
-读回来检查；不达标就**中止**，注册表一点都不动。
+在真正写注册表之前，脚本会**直接从字节解析**生成的文件（`Get-IcoContent`）：统计墨迹像素数，
+并检查 AND 掩码是否与墨迹一致。图标全空、含不透明黑像素、或掩码与墨迹矛盾，都会**中止**，
+注册表一点都不动。
 
 ### 图标为什么放在 `%LOCALAPPDATA%`
 
@@ -494,6 +570,7 @@ HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Icon
 |---|---|
 | `install.ps1` | 一行安装入口，自动处理提权（`Verify` 只读，不会弹 UAC） |
 | `ShortcutArrow.ps1` | 主脚本（Remove / Restore / Verify） |
+| `tests/Test-ShortcutArrow.ps1` | 测试套件（不依赖 Pester，失败时退出码非 0） |
 | `Remove-ShortcutArrow.bat` | 双击去小箭头 |
 | `Remove-ArrowAndShield.bat` | 双击去小箭头 + 小盾牌 |
 | `Restore-ShortcutArrow.bat` | 双击恢复（两个都还原） |
@@ -505,31 +582,57 @@ HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Icon
 |---|---|
 | `-Action Remove` | 去掉小箭头（默认） |
 | `-Action Restore` | 恢复小箭头**和**小盾牌 |
-| `-Action Verify` | 只读诊断：当前装了什么、图标格式是否安全 |
+| `-Action Verify` | 只读诊断：当前装了什么、检查图标、并实测桌面 |
 | `-IncludeShield` | 同时隐藏 UAC 盾牌覆盖层（槽位 `77`） |
-| `-IconFormat Mask1bpp` | 默认：1bpp 掩码透明（目前见过的系统上都安全） |
-| `-IconFormat Legacy32bpp` | v1.3.0 之前的旧格式——见上面的黑方块警告 |
+| `-IconFormat Faint32bpp` | 默认，也是唯一安全的类别：32bpp + 一个 `alpha = 2/255` 的像素 |
+| `-IconFormat Empty1bpp` | v1.3.0 的图标——全空；`-Action Remove` 会拒绝安装 |
+| `-IconFormat Empty32bpp` | v1.2.0 的图标——同样全空，同样拒绝 |
+| `-IconFormat Mask1bpp` / `Legacy32bpp` | 上面两个 `Empty*` 的兼容别名 |
 | `-Force` | 即使图标已存在也强制重新生成 |
-| `-UseSystemIcon` | **已弃用**——`shell32.dll,50` 是 32bpp 图标，属于有风险的格式类别 |
+| `-UseSystemIcon` | **已弃用**——`shell32.dll,50` 本身就是全透明的（全空）图标 |
 | `-NoRestart` | 不重启 explorer，下次重启后生效 |
 
-> `shell32.dll,50` 与 `imageres.dll,195` 在 Windows 11 build 26200 上实测均为完全透明
-> （`Alpha = 0`），但它们都是 **32bpp** —— 正是可能被渲染成整张纯黑方块的那一类格式。
-> 因此 `-UseSystemIcon` 仅为兼容旧用法而保留，运行时会打印警告，不是推荐路径。此外图标
-> 索引可能随 Windows 版本变动，而自己生成的 `.ico` 不可能指向错误的图标。
+> 两个 `Empty*` 格式保留下来，是为了让这个故障仍然可复现（测试套件就用它们），也让老命令行
+> 仍能解析——但 `-Action Remove` 现在会**直接中止**，而不是安装一个已知会把所有快捷方式弄黑的
+> 图标。确实想复现坏状态，用 `New-TransparentIco -Format Empty32bpp` 自己生成再手工写注册表。
+>
+> `shell32.dll,50` 与 `imageres.dll,195` 是全透明的，也就是**全空**，同属有风险的类别。
+> `-UseSystemIcon` 仅为兼容旧用法保留，运行时会打印警告，不是推荐路径。图标索引还可能随
+> Windows 版本变动，而自己生成的 `.ico` 不可能指向错误的图标。
+
+### 测试
+
+```powershell
+pwsh -File tests/Test-ShortcutArrow.ps1           # PowerShell 7
+powershell -File tests\Test-ShortcutArrow.ps1     # Windows PowerShell 5.1
+```
+
+测试套件钉住的正是这次被破坏的契约：生成的图标**不能全空**、墨迹必须保持极淡（不能有不透明
+像素）、AND 掩码必须与墨迹一致、并且校验器必须拒绝两个旧的全空格式。
 
 ### 真机实测验证
 
-| 机器 | 图标格式 | 结果 |
-|---|---|---|
-| Windows 11 25H2 build 26200，Intel 核显 + NVIDIA 独显笔记本 | 32bpp，`Alpha = 0`（v1.2.0） | ❌ **所有快捷方式被渲染成纯黑方块** |
-| 同一台机器、同样的注册表槽位、全新图标缓存 | **1bpp，AND 掩码全 1（v1.3.0）** | ✅ 覆盖层不可见，图标完好 |
+Windows 11 25H2 build 26200，Intel 核显 + NVIDIA 独显笔记本，15 个桌面快捷方式。下表每一项都是
+通过系统自带图标 API（`ExtractAssociatedIcon`）量出来的，统计每个快捷方式图标中纯黑像素的占比。
 
-失败的那次是从截图里量出来的：白色壁纸上 **32 个完全相同的纯黑 32×32 方块**，一个快捷
-方式一个。通过系统 API 提取这些快捷方式的图标，拿到的却是完全正常的彩色图标——正是这
-一点把故障定位到**覆盖层合成**而不是图标数据。删掉那两个注册表槽位，黑块立刻消失；
-装回 1bpp 图标后黑块不再出现。单纯重建图标缓存**没有用**，而系统自带的 `shell32.dll,50`
-也是 32bpp，同样属于有风险的格式。
+| 配置 | 墨迹 | 实测 |
+|---|---|---|
+| 不注册任何覆盖层 | 不适用 | ✅ 正常（最差 31.9%） |
+| 32bpp，`alpha = 0`，10 尺寸（v1.2.0） | 0 | ❌ 100%——每个快捷方式都是黑方块 |
+| 1bpp，AND 掩码全 1，10 尺寸（v1.3.0） | 0 | ❌ 100%——每个快捷方式都是黑方块 |
+| 同一张全空图标放到 ASCII 路径 | 0 | ❌ 100%（所以路径**不是**原因） |
+| 32bpp，一个 `alpha = 2/255` 的像素（v1.4.0） | 1 | ✅ 正常（最差 31.9%） |
+
+做这件事的过程中踩到两个「测量陷阱」，v1.4.0 两个都处理了：
+
+1. **做过改动的那个进程看不见结果。** 装上全空覆盖层后，脚本自己那个进程在 t+5s 到 t+60s
+   一直报 38%（「正常」），而同一时刻新起的进程报 100%。所以端到端校验改成在**子进程**里做。
+2. **shell 会短暂沿用旧的合成结果。** 改完注册表、清完缓存之后的一瞬间，shell 可能还在用之前
+   的结果。所以校验会在一个短窗口内多次采样，**取最差值**判定。回归测试里第一次采样是 38%、
+   第二次是 100%——正是第二次触发了自动回滚。
+
+v1.3.0 的校验只看图标**文件格式**，什么毛病都没看出来，于是桌面已经全黑、它仍然打印
+`no problems found`。新的端到端校验存在的意义就是防止这件事。
 
 同一台机器上两个覆盖层（小箭头**和**小盾牌）也都确认消失，事后重新读取注册表核对，
 `HKEY_CLASSES_ROOT\lnkfile\IsShortcut` 与 Windows 出厂状态完全一致——没有任何快捷方式

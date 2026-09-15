@@ -21,6 +21,67 @@
 
     CHANGELOG
     ------------------------------------------------------------------
+    v1.4.0
+      * ROOT CAUSE CORRECTED. v1.3.0 blamed the 32bpp pixel format and
+        switched to 1bpp. That was wrong: a 1bpp icon with an all-ones
+        AND mask is a COMPLETELY EMPTY icon, and an empty overlay icon
+        is what the shell composites as an opaque black square.
+
+        Measured on Windows 11 build 26200, Intel iGPU + NVIDIA dGPU:
+
+          fully transparent icon (zero pixels with alpha > 0), whether
+            1bpp/all-ones-mask or 32bpp/alpha=0 ......... black square
+          same slots, same icon cache, same paths, icon carrying a
+            single pixel at alpha = 2/255 ............... no black square
+
+        The variable is "is the icon empty", not the bit depth - and not
+        the file path either (a non-ASCII %LOCALAPPDATA% path was tested
+        separately and behaves correctly). v1.4.0 therefore generates a
+        32bpp icon that is almost empty: every pixel transparent except
+        ONE pixel at alpha = 2/255. That is invisible (0.8% opacity) but
+        keeps the icon non-empty. The AND mask matches the ink exactly.
+
+      * -Action Remove now verifies the result END TO END: after the
+        restart it extracts the icons of real desktop shortcuts and
+        measures how many of their pixels are opaque black. If every
+        sample comes back pure black the change is rolled back
+        automatically and the script exits non-zero. v1.3.0 shipped a
+        regression that blackened every shortcut on this hardware while
+        -Action Verify cheerfully reported "no problems found".
+
+        Two traps were found while building that check, and both are now
+        handled:
+
+          - The process that makes the change CANNOT see the result. With
+            an empty overlay installed, the script's own process reported
+            38% ("fine") at t+5s through t+60s while a freshly spawned
+            process reported 100% at the very same moments. The
+            measurement is therefore delegated to a child process.
+
+          - The shell can serve stale composites for a moment after the
+            registry change and the cache clear, so the child is sampled
+            repeatedly over a short window and the WORST reading decides.
+            In the regression test the first sample read 38% and the
+            second read 100% - which is what triggered the rollback.
+
+      * Icon cache clearing is reordered: explorer.exe is stopped FIRST,
+        then the cache files are deleted, then the registry is written,
+        then explorer is started. v1.3.0 deleted the cache while explorer
+        was still running, which silently failed (measured on the
+        affected machine: 30 files present, 0 deleted) and left the black
+        composites cached. The number of files actually deleted is now
+        logged instead of an unconditional "icon cache cleared".
+
+      * -IconFormat values renamed to say what they do:
+          Faint32bpp  (default, safe)   one ink pixel at alpha = 2/255
+          Empty1bpp   (unsafe, legacy)  the v1.3.0 icon: empty
+          Empty32bpp  (unsafe, legacy)  the v1.2.0 icon: empty
+        Mask1bpp and Legacy32bpp are still accepted as aliases.
+
+      * tests/Test-ShortcutArrow.ps1 added. It pins the contract: the
+        generated icon must not be empty, must stay faint, and the
+        validator must reject both legacy empty formats.
+
     v1.3.0
       * DEFAULT ICON FORMAT CHANGED to 1bpp mask-based transparency.
 
@@ -79,14 +140,21 @@
     Options:
       -Action         Remove (default) | Restore | Verify
       -IncludeShield  also hide the UAC shield overlay (value 77)
-      -IconFormat     Mask1bpp (default, safe) | Legacy32bpp (known-risky)
+      -IconFormat     Faint32bpp (default, safe) | Empty1bpp | Empty32bpp
+                      The Empty* formats are the pre-1.4.0 icons. Both are
+                      completely empty and both blacken every shortcut on
+                      affected systems, so -Action Remove refuses them: they
+                      exist so the failure stays reproducible in the tests.
+                      Mask1bpp / Legacy32bpp are accepted as aliases.
       -UseSystemIcon  DEPRECATED, see the warning printed by -Action Remove
       -Force          regenerate the icon even if it already exists
       -NoRestart      do not restart explorer.exe
 
     The transparent icon is stored in
       %LOCALAPPDATA%\ShortcutArrow\blank.ico
-    so that moving this script does not break the registry entry.
+    so that moving this script does not break the registry entry. (The path
+    itself is not a factor in the black-square bug: a non-ASCII
+    %LOCALAPPDATA% path was measured and behaves correctly.)
 #>
 [CmdletBinding()]
 param(
@@ -95,8 +163,11 @@ param(
 
     [switch]$IncludeShield,
 
-    [ValidateSet('Mask1bpp', 'Legacy32bpp')]
-    [string]$IconFormat = 'Mask1bpp',
+    # Faint32bpp is the safe default. The Empty* formats reproduce the old
+    # (broken) behaviour: they exist so the failure can be demonstrated and so
+    # that old command lines keep parsing. Mask1bpp / Legacy32bpp are aliases.
+    [ValidateSet('Faint32bpp', 'Empty1bpp', 'Empty32bpp', 'Mask1bpp', 'Legacy32bpp')]
+    [string]$IconFormat = 'Faint32bpp',
 
     [switch]$UseSystemIcon,
 
@@ -107,7 +178,12 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '1.3.0'
+# Dot-sourcing the script (` . .\ShortcutArrow.ps1`) only defines the functions,
+# which is how tests/Test-ShortcutArrow.ps1 drives them. Executing the file
+# normally runs the main block at the bottom.
+$Script:DotSourced = ($MyInvocation.InvocationName -eq '.')
+
+$ScriptVersion = '1.4.0'
 $BaseDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
 $IcoDir   = Join-Path $env:LOCALAPPDATA 'ShortcutArrow'
 $IcoPath  = Join-Path $IcoDir 'blank.ico'
@@ -123,9 +199,17 @@ $ShieldSlot = '77'
 # one more code path that can go wrong.
 $IcoSizes = @(16, 20, 24, 32, 40, 48, 64, 96, 128, 256)
 
+# The overlay must NOT be completely empty. An empty overlay icon is what the
+# shell composites as an opaque black square over the whole shortcut; one pixel
+# at this alpha keeps the icon non-empty while remaining invisible (0.8%
+# opacity). Verified on the affected machine: alpha = 2 shows nothing and the
+# black squares stay away.
+$InkAlpha = 2
+
 # Built-in blank icon, kept only for -UseSystemIcon.
-# NOTE: this is a 32bpp icon, i.e. exactly the format that renders as an
-# opaque black square on affected systems. Prefer the generated 1bpp icon.
+# NOTE: shell32.dll,50 is itself a fully transparent (i.e. EMPTY) icon, so it
+# sits in the same risky class as the Empty* formats. Kept for backwards
+# compatibility only.
 $SystemIcon = '%SystemRoot%\System32\shell32.dll,50'
 
 function Write-Log {
@@ -141,26 +225,50 @@ function Test-IsAdmin {
     return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+function Test-IconFormatAlias {
+    <#  Map a possibly-legacy -IconFormat value onto its canonical name. #>
+    param([Parameter(Mandatory)][string]$Name)
+    switch ($Name) {
+        'Mask1bpp'    { return 'Empty1bpp' }
+        'Legacy32bpp' { return 'Empty32bpp' }
+        default       { return $Name }
+    }
+}
+
 function New-TransparentIco {
     <#
-        Hand-assembles a fully transparent .ico.
+        Hand-assembles the overlay .ico.
 
-        Mask1bpp (default, recommended)
-            1bpp images: no alpha channel exists. Transparency is expressed
-            by the AND mask, where every bit set means "leave the screen
-            unchanged". There is nothing for a renderer to misinterpret.
+        Faint32bpp (default, safe)
+            32bpp BGRA. Every pixel is transparent (0,0,0,0) except ONE
+            pixel at alpha = $InkAlpha, whose AND-mask bit is cleared to
+            match. The icon is therefore non-empty - and being non-empty is
+            exactly what stops the shell from compositing it as an opaque
+            black square - while the ink stays invisible in practice.
 
-        Legacy32bpp
-            The format written by v1.2.0 and earlier: BGRA 0,0,0,0 pixels
-            plus an all-ones mask. Correct on paper, and correct on most
-            machines - but on affected systems the shell paints those
-            pixels as opaque black, covering the whole icon.
+            Why not a "cleaner" all-transparent icon: on Windows 11 build
+            26200 (Intel iGPU + NVIDIA dGPU) ANY fully transparent overlay
+            is painted as an opaque black square over the whole shortcut,
+            whether it is 1bpp with an all-ones mask or 32bpp with alpha=0.
+            One faint pixel removes the failure. The bit depth does not
+            matter - and a 1bpp image cannot express "faint": it can only
+            be completely empty or show an opaque black pixel, which is why
+            v1.3.0's 1bpp "fix" still blackened every icon.
+
+        Empty1bpp / Empty32bpp (unsafe, legacy)
+            The v1.3.0 and v1.2.0 icons. Both are completely empty and both
+            blacken every shortcut on affected systems. They are kept so the
+            bug can be reproduced in tests; -Action Remove refuses to
+            install them.
     #>
     param(
         [Parameter(Mandatory)][string]$Path,
-        [ValidateSet('Mask1bpp', 'Legacy32bpp')][string]$Format = 'Mask1bpp',
+        [ValidateSet('Faint32bpp', 'Empty1bpp', 'Empty32bpp', 'Mask1bpp', 'Legacy32bpp')]
+        [string]$Format = 'Faint32bpp',
         [int[]]$Sizes = $IcoSizes
     )
+
+    $Format = Test-IconFormatAlias -Name $Format
 
     $dir = Split-Path -Parent $Path
     if (-not (Test-Path -LiteralPath $dir)) {
@@ -169,7 +277,18 @@ function New-TransparentIco {
 
     $images = @()
     foreach ($s in $Sizes) {
-        $rowBytes = [int]([Math]::Ceiling($s / 32.0) * 4)   # 1bpp row padded to 4 bytes
+        $isFaint = ($Format -eq 'Faint32bpp')
+
+        if ($isFaint -or $Format -eq 'Empty32bpp') {
+            $bpp    = 32
+            $xorRow = $s * 4
+        }
+        else {
+            $bpp    = 1
+            $xorRow = [int]([Math]::Ceiling($s / 32.0) * 4)   # 1bpp row padded to 4 bytes
+        }
+        $maskRow = [int]([Math]::Ceiling($s / 32.0) * 4)
+
         $ms = New-Object System.IO.MemoryStream
         $bw = New-Object System.IO.BinaryWriter($ms)
 
@@ -178,36 +297,40 @@ function New-TransparentIco {
         $bw.Write([int]$s)                                   # biWidth
         $bw.Write([int](2 * $s))                             # biHeight
         $bw.Write([int16]1)                                  # biPlanes
-
-        if ($Format -eq 'Mask1bpp') {
-            $bw.Write([int16]1)                              # biBitCount = 1
-            $bw.Write([int]0)                                # BI_RGB
-            $bw.Write([int]($rowBytes * $s))                 # biSizeImage
-            $bw.Write([int]0); $bw.Write([int]0)             # pels per meter
+        $bw.Write([int16]$bpp)                               # biBitCount
+        $bw.Write([int]0)                                    # BI_RGB
+        $bw.Write([int]($xorRow * $s))                       # biSizeImage
+        $bw.Write([int]0); $bw.Write([int]0)                 # pels per meter
+        if ($bpp -eq 1) {
             $bw.Write([int]2); $bw.Write([int]2)             # clrUsed / clrImportant
-
             $bw.Write([byte[]](0, 0, 0, 0))                  # palette[0] = black
             $bw.Write([byte[]](255, 255, 255, 0))            # palette[1] = white
-
-            $bw.Write((New-Object byte[] ($rowBytes * $s)))  # XOR bitmap, all index 0
         }
         else {
-            $bw.Write([int16]32)                             # biBitCount = 32
-            $bw.Write([int]0)                                # BI_RGB
-            $bw.Write([int]($s * $s * 4))                    # biSizeImage
-            $bw.Write([int]0); $bw.Write([int]0)
-            $bw.Write([int]0); $bw.Write([int]0)
-
-            $bw.Write((New-Object byte[] ($s * $s * 4)))     # BGRA 0,0,0,0
+            $bw.Write([int]0); $bw.Write([int]0)             # clrUsed / clrImportant
         }
 
-        # AND mask: every bit set => "leave screen unchanged" (transparent).
-        $row = New-Object byte[] $rowBytes
-        for ($i = 0; $i -lt $rowBytes; $i++) { $row[$i] = 0xFF }
-        for ($y = 0; $y -lt $s; $y++) { $bw.Write($row) }
+        # XOR bitmap: all zeros (transparent black) except the single ink pixel
+        # that keeps the icon from being completely empty.
+        $xor = New-Object byte[] ($xorRow * $s)
+
+        # AND mask: a set bit means "leave the screen unchanged".
+        $mask = New-Object byte[] ($maskRow * $s)
+        for ($i = 0; $i -lt $mask.Length; $i++) { $mask[$i] = 0xFF }
+
+        if ($isFaint) {
+            # Visual top-left pixel. BMP rows are stored bottom-up, so it lives
+            # in the last file row; clear bit 0 of that row's first mask byte.
+            $xor[(($s - 1) * $s) * 4 + 3] = [byte]$InkAlpha
+            $mi = ($s - 1) * $maskRow
+            $mask[$mi] = [byte]([int]$mask[$mi] -band 0x7F)
+        }
+
+        $bw.Write($xor)
+        $bw.Write($mask)
 
         $bw.Flush()
-        $images += , @{ Size = $s; Data = $ms.ToArray() }
+        $images += , @{ Size = $s; Bpp = $bpp; Data = $ms.ToArray() }
         $bw.Dispose()
         $ms.Dispose()
     }
@@ -225,15 +348,14 @@ function New-TransparentIco {
     foreach ($img in $images) {
         $dim = 0
         if ($img.Size -lt 256) { $dim = $img.Size }
-        $bpp = 1
-        $colors = 2
-        if ($Format -eq 'Legacy32bpp') { $bpp = 32; $colors = 0 }
+        $colors = 0
+        if ($img.Bpp -eq 1) { $colors = 2 }
         $bw.Write([byte]$dim)            # width  (0 means 256)
         $bw.Write([byte]$dim)            # height (0 means 256)
         $bw.Write([byte]$colors)         # colour count
         $bw.Write([byte]0)               # reserved
         $bw.Write([int16]1)              # planes
-        $bw.Write([int16]$bpp)           # bit count
+        $bw.Write([int16]$img.Bpp)       # bit count
         $bw.Write([int]$img.Data.Length) # bytes in resource
         $bw.Write([int]$offset)          # offset
         $offset += $img.Data.Length
@@ -272,127 +394,496 @@ function Get-IcoInfo {
     return $list
 }
 
+function Get-IcoContent {
+    <#
+        Read-only inspection of what an .ico actually contains, straight from
+        the bytes - no GDI+ involved, so it reports what the file says rather
+        than what one particular renderer makes of it.
+
+        TotalInk is the number of pixels that are not fully transparent:
+          32bpp -> pixels whose alpha byte is > 0
+          1bpp  -> bits set in the XOR bitmap (a visible pixel)
+
+        TotalInk = 0 means a COMPLETELY EMPTY icon. That is the condition the
+        shell turns into an opaque black square, and it is the one thing
+        v1.3.0's format-only check could not see.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    $r = [pscustomobject]@{
+        Ok           = $false
+        Sizes        = @()
+        Bpp          = @()
+        TotalInk     = 0
+        MaxInkAlpha  = 0
+        OpaqueBlack  = 0
+        MaskMismatch = 0
+        Empty        = $true
+        Images       = @()
+        Message      = ''
+    }
+
+    if (-not (Test-Path -LiteralPath $Path)) { $r.Message = 'file not found'; return $r }
+
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    if (($bytes.Length -lt 6) -or
+        ([BitConverter]::ToUInt16($bytes, 0) -ne 0) -or
+        ([BitConverter]::ToUInt16($bytes, 2) -ne 1)) {
+        $r.Message = 'not a valid .ico'
+        return $r
+    }
+
+    $count  = [BitConverter]::ToUInt16($bytes, 4)
+    $images = @()
+
+    for ($i = 0; $i -lt $count; $i++) {
+        $o = 6 + (16 * $i)
+        if (($o + 16) -gt $bytes.Length) { break }
+
+        $w   = [int]$bytes[$o]
+        if ($w -eq 0) { $w = 256 }
+        $bpp = [BitConverter]::ToUInt16($bytes, $o + 6)
+        $off = [BitConverter]::ToUInt32($bytes, $o + 12)
+
+        $img = [pscustomobject]@{
+            Width = $w; Bpp = $bpp; Ink = 0; MaxAlpha = 0; Opaque = 0; MaskMismatch = 0
+        }
+
+        if (($off + 40) -gt $bytes.Length) { $images += $img; continue }
+        if (($bytes[$off] -eq 0x89) -and ($bytes[$off + 1] -eq 0x50)) {
+            # PNG-compressed image: no AND mask, alpha lives inside the PNG.
+            $img.MaxAlpha = -1
+            $images += $img
+            continue
+        }
+
+        $biSize  = [BitConverter]::ToUInt32($bytes, $off)
+        $biBpp   = [BitConverter]::ToUInt16($bytes, $off + 14)
+        $palLen  = 0
+        if ($biBpp -le 8) { $palLen = (1 -shl $biBpp) * 4 }
+        $xorRow  = [int]([Math]::Floor(($w * $biBpp + 31) / 32) * 4)
+        $maskRow = [int]([Math]::Floor(($w + 31) / 32) * 4)
+        $xorOff  = $off + $biSize + $palLen
+        $maskOff = $xorOff + ($xorRow * $w)
+
+        for ($y = 0; $y -lt $w; $y++) {
+            for ($x = 0; $x -lt $w; $x++) {
+                $ink = $false
+
+                if ($biBpp -eq 32) {
+                    $p = $xorOff + ((($y * $w) + $x) * 4)
+                    if (($p + 3) -lt $bytes.Length) {
+                        $a = [int]$bytes[$p + 3]
+                        if ($a -gt 0) {
+                            $ink = $true
+                            $img.Ink = $img.Ink + 1
+                            if ($a -gt $img.MaxAlpha) { $img.MaxAlpha = $a }
+                            if (($a -ge 200) -and ($bytes[$p] -le 12) -and
+                                ($bytes[$p + 1] -le 12) -and ($bytes[$p + 2] -le 12)) {
+                                $img.Opaque = $img.Opaque + 1
+                            }
+                        }
+                    }
+                }
+                else {
+                    $p = $xorOff + ($y * $xorRow) + [int][Math]::Floor($x / 8)
+                    if ($p -lt $bytes.Length) {
+                        $bit = 7 - ($x % 8)
+                        if (((([int]$bytes[$p]) -shr $bit) -band 1) -eq 1) {
+                            $ink = $true
+                            $img.Ink = $img.Ink + 1
+                            $img.MaxAlpha = 255
+                            $img.Opaque = $img.Opaque + 1
+                        }
+                    }
+                }
+
+                # AND mask: a cleared bit should mean "ink", a set bit "transparent".
+                $mp = $maskOff + ($y * $maskRow) + [int][Math]::Floor($x / 8)
+                if ($mp -lt $bytes.Length) {
+                    $mbit = 7 - ($x % 8)
+                    $mval = (([int]$bytes[$mp]) -shr $mbit) -band 1
+                    if (($mval -eq 0) -ne $ink) { $img.MaskMismatch = $img.MaskMismatch + 1 }
+                }
+            }
+        }
+
+        $r.TotalInk     = $r.TotalInk + $img.Ink
+        $r.OpaqueBlack  = $r.OpaqueBlack + $img.Opaque
+        $r.MaskMismatch = $r.MaskMismatch + $img.MaskMismatch
+        if ($img.MaxAlpha -gt $r.MaxInkAlpha) { $r.MaxInkAlpha = $img.MaxAlpha }
+        $images += $img
+    }
+
+    $r.Images = $images
+    $r.Sizes  = @($images | ForEach-Object { $_.Width })
+    $r.Bpp    = @($images | ForEach-Object { $_.Bpp } | Sort-Object -Unique)
+    $r.Empty  = ($r.TotalInk -eq 0)
+    $r.Ok     = ((-not $r.Empty) -and ($r.OpaqueBlack -eq 0))
+    return $r
+}
+
 function Get-IcoFormat {
-    param([Parameter(Mandatory)]$Info)
+    <#  Detected format. Says EMPTY when the icon carries no ink at all. #>
+    param([Parameter(Mandatory)]$Info, $Content)
+
     $bpps = @($Info | ForEach-Object { $_.BitsPerPixel } | Sort-Object -Unique)
     if ($bpps.Count -eq 0) { return 'unknown' }
-    if ($bpps.Count -eq 1 -and $bpps[0] -eq 1) { return 'Mask1bpp' }
-    if ($bpps -contains 32) { return 'Legacy32bpp' }
+
+    $empty = $true
+    if ($Content) { $empty = [bool]$Content.Empty }
+
+    if (($bpps.Count -eq 1) -and ($bpps[0] -eq 1)) {
+        if ($empty) { return 'Empty1bpp' } else { return '1bpp-ink' }
+    }
+    if ($bpps -contains 32) {
+        if ($empty) { return 'Empty32bpp' } else { return '32bpp-ink' }
+    }
     return ('mixed:' + ($bpps -join '/'))
 }
 
 function Test-TransparentIco {
     <#
-        Two independent checks, and it matters which one does the work:
+        Answers one question: is this icon SAFE to install as the overlay?
 
-        1) FORMAT check - the real protection. A 32bpp icon is refused when
-           Mask1bpp was requested. The shell-side bug that paints 32bpp
-           alpha=0 overlays as opaque black is invisible to user-mode pixel
-           readback, so no amount of pixel inspection can detect it.
-           Avoiding the format is the only reliable defence.
+        A safe overlay icon
+          * is NOT completely empty. An empty overlay is what the shell
+            composites as an opaque black square over the whole shortcut on
+            affected systems. This is the check v1.3.0 lacked: it inspected
+            the FORMAT and declared a completely empty 1bpp icon "safe".
+          * contains no opaque black pixels (a blank icon that paints black
+            is not blank)
+          * has an AND mask that agrees with its ink
 
-        2) PIXEL sanity check - catches a malformed or accidentally opaque
-           icon: a transparent overlay must contain zero opaque-black
-           pixels. Skipped gracefully when System.Drawing is unavailable.
+        ExpectFormat optionally pins the pixel-format class. The legacy
+        Empty1bpp / Empty32bpp classes can never pass, because being empty is
+        exactly the defect this function exists to catch.
     #>
     param(
         [Parameter(Mandatory)][string]$Path,
-        [ValidateSet('Mask1bpp', 'Legacy32bpp', 'Any')][string]$ExpectFormat = 'Any'
+        [ValidateSet('Faint32bpp', 'Empty1bpp', 'Empty32bpp', 'Mask1bpp', 'Legacy32bpp', 'Any')]
+        [string]$ExpectFormat = 'Any'
     )
 
     $r = [pscustomobject]@{
-        Ok          = $true
-        Format      = 'unknown'
-        Sizes       = @()
-        OpaqueBlack = 0
-        PixelCheck  = 'skipped'
-        Message     = ''
+        Ok           = $true
+        Format       = 'unknown'
+        Sizes        = @()
+        Empty        = $false
+        TotalInk     = 0
+        MaxInkAlpha  = 0
+        OpaqueBlack  = 0
+        MaskMismatch = 0
+        Message      = ''
     }
 
-    if (-not (Test-Path -LiteralPath $Path)) {
-        $r.Ok = $false; $r.Message = 'file not found'; return $r
-    }
+    $content = Get-IcoContent -Path $Path
+    if ($content.Message) { $r.Ok = $false; $r.Message = $content.Message; return $r }
+
     $info = Get-IcoInfo -Path $Path
-    if (-not $info) {
-        $r.Ok = $false; $r.Message = 'not a valid .ico'; return $r
-    }
+    if (-not $info) { $r.Ok = $false; $r.Message = 'not a valid .ico'; return $r }
 
-    $r.Format = Get-IcoFormat -Info $info
-    $r.Sizes  = @($info | ForEach-Object { $_.Width })
+    $r.Format       = Get-IcoFormat -Info $info -Content $content
+    $r.Sizes        = $content.Sizes
+    $r.Empty        = $content.Empty
+    $r.TotalInk     = $content.TotalInk
+    $r.MaxInkAlpha  = $content.MaxInkAlpha
+    $r.OpaqueBlack  = $content.OpaqueBlack
+    $r.MaskMismatch = $content.MaskMismatch
 
-    if ($ExpectFormat -ne 'Any' -and $r.Format -ne $ExpectFormat) {
+    if ($r.Empty) {
         $r.Ok = $false
-        $r.Message = ('format is {0}, expected {1}' -f $r.Format, $ExpectFormat)
+        $r.Message = 'icon is completely empty - the shell paints an empty overlay as an opaque black square over the whole shortcut'
+        return $r
+    }
+    if ($r.OpaqueBlack -gt 0) {
+        $r.Ok = $false
+        $r.Message = ('{0} opaque black pixel(s) found - this icon is not blank' -f $r.OpaqueBlack)
+        return $r
+    }
+    if ($r.MaskMismatch -gt 0) {
+        $r.Ok = $false
+        $r.Message = ('{0} pixel(s) where the AND mask disagrees with the ink' -f $r.MaskMismatch)
         return $r
     }
 
-    try {
-        Add-Type -AssemblyName System.Drawing -ErrorAction Stop
-        $check = @(16, 32, 48) | Where-Object { $r.Sizes -contains $_ }
-        if (-not $check) { $check = @($r.Sizes[0]) }
-        foreach ($s in $check) {
-            $ico = [System.Drawing.Icon]::new($Path, $s, $s)
-            $bm  = $ico.ToBitmap()
-            $rect = [System.Drawing.Rectangle]::new(0, 0, $bm.Width, $bm.Height)
-            $data = $bm.LockBits($rect,
-                        [System.Drawing.Imaging.ImageLockMode]::ReadOnly,
-                        [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
-            $buf = New-Object byte[] ($data.Stride * $bm.Height)
-            [System.Runtime.InteropServices.Marshal]::Copy($data.Scan0, $buf, 0, $buf.Length)
-            $bm.UnlockBits($data)
-            for ($y = 0; $y -lt $bm.Height; $y++) {
-                $rowOff = $y * $data.Stride
-                for ($x = 0; $x -lt $bm.Width; $x++) {
-                    $p = $rowOff + ($x * 4)
-                    if (($buf[$p + 3] -ge 200) -and
-                        ($buf[$p] -le 12) -and ($buf[$p + 1] -le 12) -and ($buf[$p + 2] -le 12)) {
-                        $r.OpaqueBlack++
-                    }
-                }
-            }
-            $bm.Dispose(); $ico.Dispose()
+    $want = Test-IconFormatAlias -Name $ExpectFormat
+    if ($want -eq 'Faint32bpp') {
+        if (($content.Bpp.Count -ne 1) -or (-not ($content.Bpp -contains 32))) {
+            $r.Ok = $false
+            $r.Message = ('expected a 32bpp icon, found {0}' -f ($content.Bpp -join '/'))
+            return $r
         }
-        $r.PixelCheck = 'ok'
-    }
-    catch {
-        $r.PixelCheck = 'unavailable'
-        $r.Message = $_.Exception.Message
-    }
-
-    if ($r.OpaqueBlack -gt 0) {
-        $r.Ok = $false
-        $r.Message = ('{0} opaque black pixel(s) found' -f $r.OpaqueBlack)
     }
     return $r
 }
 
+function Measure-OverlayBlack {
+    <#
+        ONE observation of how black the desktop shortcuts look, measured in a
+        FRESHLY SPAWNED process.
+
+        Why a child process: the process that just changed the overlay registry
+        value and cleared the icon cache can keep reporting the PREVIOUS
+        composites for as long as it lives. Measured on the affected machine
+        with a deliberately empty overlay installed:
+
+            t+5s .. t+60s   the process that made the change: 38%  ("fine")
+            t+5s .. t+60s   a fresh process, same moments:    100% (black)
+
+        An in-process check is therefore blind to exactly the regression it is
+        meant to catch - which is how v1.3.0 could ship a machine where every
+        shortcut was a black square while reporting "no problems found".
+
+        Read-only; the child process only reads icons.
+    #>
+    param(
+        [int]$MaxBlackPercent = 95,
+        [int]$SampleCount = 6
+    )
+
+    $r = [pscustomobject]@{
+        Ok              = $true
+        Sampled         = 0
+        MaxBlackPercent = 0
+        Verdict         = 'not sampled'
+        Details         = @()
+    }
+
+    $desktop = [Environment]::GetFolderPath('Desktop')
+    $links = @()
+    if ($desktop -and (Test-Path -LiteralPath $desktop)) {
+        $links = @(Get-ChildItem -LiteralPath $desktop -Filter '*.lnk' -ErrorAction SilentlyContinue |
+                   Select-Object -First $SampleCount)
+    }
+    if ($links.Count -lt 2) {
+        $r.Verdict = 'skipped: fewer than two desktop shortcuts to sample'
+        return $r
+    }
+
+    $desktop = [Environment]::GetFolderPath('Desktop')
+    $outFile = Join-Path $env:TEMP ('sa-overlay-' + [guid]::NewGuid().ToString('N') + '.txt')
+    $sample  = $SampleCount
+
+    $code = @"
+`$ErrorActionPreference = 'SilentlyContinue'
+Add-Type -AssemblyName System.Drawing
+`$lines = @()
+foreach (`$p in (Get-ChildItem -LiteralPath "$desktop" -Filter '*.lnk' | Select-Object -First $sample)) {
+    `$pct = -1
+    try {
+        `$ic = [System.Drawing.Icon]::ExtractAssociatedIcon(`$p.FullName)
+        `$bm = `$ic.ToBitmap()
+        `$w = `$bm.Width; `$h = `$bm.Height; `$op = 0; `$dk = 0
+        for (`$y = 0; `$y -lt `$h; `$y++) {
+            for (`$x = 0; `$x -lt `$w; `$x++) {
+                `$c = `$bm.GetPixel(`$x, `$y)
+                if (`$c.A -gt 200) { `$op++; if (`$c.R -lt 24 -and `$c.G -lt 24 -and `$c.B -lt 24) { `$dk++ } }
+            }
+        }
+        `$bm.Dispose(); `$ic.Dispose()
+        if (`$op -gt 0) { `$pct = [math]::Round(100 * `$dk / `$op, 1) }
+    } catch { }
+    `$lines += ('{0}={1}' -f `$p.BaseName, `$pct)
+}
+Set-Content -LiteralPath "$outFile" -Value (`$lines -join ';') -Encoding UTF8
+"@
+
+    $b64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($code))
+    try {
+        Start-Process -FilePath 'powershell.exe' `
+            -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand',$b64) `
+            -WindowStyle Hidden -Wait -ErrorAction Stop
+    }
+    catch {
+        $r.Verdict = 'skipped: could not start the measurement process'
+        return $r
+    }
+    if (-not (Test-Path -LiteralPath $outFile)) {
+        $r.Verdict = 'skipped: the measurement process produced no result'
+        return $r
+    }
+
+    $raw = Get-Content -LiteralPath $outFile -Raw -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $outFile -Force -ErrorAction SilentlyContinue
+
+    foreach ($part in ($raw -split ';')) {
+        if ($part -match '^(.*)=(-?\d+(?:\.\d+)?)$') {
+            $pct = [double]$Matches[2]
+            if ($pct -lt 0) { $pct = $null }
+            $r.Details += [pscustomobject]@{ Name = $Matches[1]; BlackPercent = $pct }
+            if ($null -ne $pct) {
+                $r.Sampled++
+                if ($pct -gt $r.MaxBlackPercent) { $r.MaxBlackPercent = $pct }
+            }
+        }
+    }
+
+    if ($r.Sampled -lt 2) {
+        $r.Verdict = 'skipped: could not read enough shortcut icons'
+        return $r
+    }
+    if ($r.MaxBlackPercent -gt $MaxBlackPercent) {
+        $r.Ok = $false
+        $r.Verdict = ('FAIL: shortcuts are rendered as solid black squares (max {0}% opaque black pixels) - the overlay composite is broken' -f $r.MaxBlackPercent)
+    }
+    else {
+        $r.Verdict = ('OK: sampled {0} shortcut(s), max {1}% opaque black pixels' -f $r.Sampled, $r.MaxBlackPercent)
+    }
+    return $r
+}
+
+function Test-OverlayResult {
+    <#
+        End-to-end check: does the desktop actually LOOK right?
+
+        Every observation runs in a fresh process (see Measure-OverlayBlack)
+        and the check repeats over a short window, letting the WORST reading
+        decide: right after explorer restarts the shell may still be mid
+        rebuild, and a single sample taken then is not evidence either way.
+
+        This is the check that would have caught the v1.3.0 regression, whose
+        own verification inspected the icon FILE's format, found nothing wrong
+        and declared the machine healthy while every shortcut on the desktop
+        was painted as a black square.
+
+        Read-only; safe to call at any time.
+    #>
+    param(
+        [int]$MaxBlackPercent = 95,
+        [int]$SampleCount = 6,
+        [int]$Attempts = 3,
+        [int]$AttemptDelaySeconds = 3
+    )
+
+    $r = [pscustomobject]@{
+        Ok              = $true
+        Sampled         = 0
+        MaxBlackPercent = 0
+        Attempts        = 0
+        Verdict         = 'not sampled'
+        Details         = @()
+    }
+
+    $worstMax    = -1
+    $worstDetail = @()
+    $bestSampled = 0
+
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        Start-Sleep -Seconds $AttemptDelaySeconds
+        $m = Measure-OverlayBlack -SampleCount $SampleCount
+
+        if ($m.Sampled -lt 2) {
+            if ($attempt -eq $Attempts) { $r.Verdict = 'skipped: ' + $m.Verdict; return $r }
+            continue
+        }
+
+        $r.Attempts = $attempt
+        if ($m.Sampled -gt $bestSampled) { $bestSampled = $m.Sampled }
+        if ($m.MaxBlackPercent -gt $worstMax) {
+            $worstMax    = $m.MaxBlackPercent
+            $worstDetail = $m.Details
+        }
+
+        Write-Log ('    overlay check {0}/{1}: worst {2}% opaque black over {3} shortcut(s)' -f $attempt, $Attempts, $m.MaxBlackPercent, $m.Sampled)
+
+        if ($m.MaxBlackPercent -gt $MaxBlackPercent) { break }
+    }
+
+    $r.Sampled = $bestSampled
+    if ($worstMax -ge 0) { $r.MaxBlackPercent = $worstMax }
+    $r.Details = $worstDetail
+
+    if ($r.Sampled -lt 2) {
+        $r.Verdict = 'skipped: could not read enough shortcut icons'
+        return $r
+    }
+    if ($r.MaxBlackPercent -gt $MaxBlackPercent) {
+        $r.Ok = $false
+        $r.Verdict = ('FAIL: shortcuts are rendered as solid black squares (worst of {0} observation(s): {1}% opaque black pixels) - the overlay composite is broken' -f $r.Attempts, $r.MaxBlackPercent)
+    }
+    else {
+        $r.Verdict = ('OK: sampled {0} shortcut(s) over {1} observation(s), worst {2}% opaque black pixels' -f $r.Sampled, $r.Attempts, $r.MaxBlackPercent)
+    }
+    return $r
+}
+
+function Stop-Explorer {
+    Write-Log '  stopping explorer.exe ...'
+    Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+    for ($i = 0; $i -lt 20; $i++) {
+        if (-not (Get-Process explorer -ErrorAction SilentlyContinue)) { break }
+        Start-Sleep -Milliseconds 250
+    }
+    if (Get-Process explorer -ErrorAction SilentlyContinue) {
+        # Windows restarts the shell on its own when AutoRestartShell is on
+        # (the default), so this is expected rather than fatal. Clear-IconCache
+        # retries if a cache file turns out to be locked.
+        Write-Log '  note: explorer.exe is running again (Windows restarts the shell by'
+        Write-Log '        itself). If a cache file is locked, it is retried below.'
+    }
+}
+
+function Start-Explorer {
+    if (-not (Get-Process explorer -ErrorAction SilentlyContinue)) {
+        Write-Log '  starting explorer.exe ...'
+        Start-Process 'explorer.exe'
+        Start-Sleep -Seconds 3
+    }
+    # Let the shell settle before the result is measured.
+    Start-Sleep -Seconds 6
+}
+
 function Clear-IconCache {
+    <#
+        Must run while explorer.exe is STOPPED.
+
+        v1.3.0 deleted these files with the shell still running, which fails
+        silently - measured on the affected machine: 30 files present, 0
+        deleted - and leaves the wrong (black) composites cached. That is why
+        "rebuild the icon cache" appeared not to help. The counts are logged
+        now instead of an unconditional "icon cache cleared".
+    #>
     $explorerDir = Join-Path $env:LOCALAPPDATA 'Microsoft\Windows\Explorer'
     $targets = @(
         @{ Dir = $env:LOCALAPPDATA; Filter = 'IconCache.db' },
         @{ Dir = $explorerDir;      Filter = 'iconcache_*.db' },
         @{ Dir = $explorerDir;      Filter = 'thumbcache_*.db' }
     )
-    foreach ($t in $targets) {
-        if (Test-Path -LiteralPath $t.Dir) {
-            Get-ChildItem -LiteralPath $t.Dir -Filter $t.Filter -Force -ErrorAction SilentlyContinue |
-                ForEach-Object {
-                    try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop }
-                    catch { Write-Log ('  cache locked, skipped: ' + $_.Name) }
+
+    $existed = 0; $deleted = 0; $locked = 0
+    for ($pass = 1; $pass -le 2; $pass++) {
+        $existed = 0; $deleted = 0; $locked = 0
+        foreach ($t in $targets) {
+            if (Test-Path -LiteralPath $t.Dir) {
+                foreach ($f in @(Get-ChildItem -LiteralPath $t.Dir -Filter $t.Filter -Force -ErrorAction SilentlyContinue)) {
+                    $existed++
+                    try {
+                        Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop
+                        $deleted++
+                    }
+                    catch {
+                        $locked++
+                        Write-Log ('  cache file could not be deleted: ' + $f.Name)
+                    }
                 }
+            }
+        }
+        if ($locked -eq 0) { break }
+        if ($pass -eq 1) {
+            # Almost always a freshly auto-restarted shell holding the files.
+            Write-Log '  some cache files were locked - stopping explorer.exe again and retrying'
+            Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
         }
     }
-    Write-Log '  icon cache cleared'
-}
 
-function Restart-Explorer {
-    Write-Log '  restarting explorer.exe ...'
-    Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 3
-    if (-not (Get-Process explorer -ErrorAction SilentlyContinue)) {
-        Start-Process 'explorer.exe'
-        Start-Sleep -Seconds 2
+    Write-Log ('  icon cache: {0} file(s) found, {1} deleted, {2} locked' -f $existed, $deleted, $locked)
+    if ($locked -gt 0) {
+        Write-Log '  WARNING: some cache files stayed locked. Stale composites may survive this run.'
+        Write-Log '           Reboot and run again if the desktop still looks wrong.'
     }
+    return [pscustomobject]@{ Existed = $existed; Deleted = $deleted; Locked = $locked }
 }
 
 function Get-ShellIconValue {
@@ -462,6 +953,8 @@ function Resolve-IconReference {
 # ----------------------------------------------------------------------------
 # main
 # ----------------------------------------------------------------------------
+if (-not $Script:DotSourced) {
+
 $isAdmin = Test-IsAdmin
 
 # ------------------------------------------------------------------ Verify --
@@ -491,31 +984,39 @@ if ($Action -eq 'Verify') {
 
             if ($file -notmatch '\.ico$') {
                 Write-Log '         -> external icon reference (not an .ico); cannot be inspected here.'
-                Write-Log '         -> NOTE: a 32bpp alpha=0 overlay renders as an opaque black square'
+                Write-Log '         -> NOTE: an EMPTY overlay icon renders as an opaque black square'
                 Write-Log '            over the whole icon on affected systems. Prefer the generated icon.'
                 continue
             }
 
-            $info = Get-IcoInfo -Path $file
-            if ($info) { $fmt = Get-IcoFormat -Info $info } else { $fmt = 'unreadable' }
+            $info    = Get-IcoInfo -Path $file
+            $content = Get-IcoContent -Path $file
+            if ($info) { $fmt = Get-IcoFormat -Info $info -Content $content } else { $fmt = 'unreadable' }
             $test  = Test-TransparentIco -Path $file -ExpectFormat 'Any'
             $sizes = ($test.Sizes | Sort-Object -Unique) -join ','
-            Write-Log ('         -> {0}  format={1}  sizes={2}  pixelCheck={3}' -f $file, $fmt, $sizes, $test.PixelCheck)
+            Write-Log ('         -> {0}  format={1}  sizes={2}  ink={3}  maxInkAlpha={4}' -f $file, $fmt, $sizes, $content.TotalInk, $content.MaxInkAlpha)
 
-            if ($fmt -eq 'Legacy32bpp') {
-                Write-Log '         -> PROBLEM: this is the 32bpp format that paints entire shortcuts'
-                Write-Log '            black on affected systems. Run -Action Remove to replace it.'
-                $problems++
-            }
-            elseif (-not $test.Ok) {
+            if (-not $test.Ok) {
                 Write-Log ('         -> PROBLEM: icon failed verification ({0})' -f $test.Message)
                 $problems++
             }
             else {
-                Write-Log '         -> OK: mask-based transparency, safe format.'
+                Write-Log '         -> OK: the icon is non-empty and contains no opaque black pixels.'
             }
         }
     }
+    # The check that actually matters: what does the desktop look like?
+    $result = Test-OverlayResult
+    Write-Log ('  overlay check: ' + $result.Verdict)
+    foreach ($d in $result.Details) {
+        Write-Log ('    {0} = {1}% opaque black' -f $d.Name, $d.BlackPercent)
+    }
+    if (-not $result.Ok) {
+        Write-Log '         -> PROBLEM: shortcuts are painted as black squares right now.'
+        Write-Log '            Run -Action Restore (or delete both Shell Icons values) to recover.'
+        $problems++
+    }
+
     if ($problems -eq 0) {
         Write-Log '=== no problems found. ==='
     }
@@ -535,9 +1036,10 @@ if ($Action -eq 'Remove') {
 
     if ($UseSystemIcon) {
         Write-Log '  WARNING: -UseSystemIcon is deprecated.'
-        Write-Log ('           {0} is a 32bpp icon - the same format class' -f $SystemIcon)
-        Write-Log '           that renders as an opaque black square over the whole icon'
-        Write-Log '           on affected systems. The generated 1bpp icon is the safe path.'
+        Write-Log ('           {0} is itself a fully transparent icon, i.e. an EMPTY one,' -f $SystemIcon)
+        Write-Log '           so it sits in the same risky class as the Empty* formats: an'
+        Write-Log '           empty overlay can be composited as an opaque black square over'
+        Write-Log '           every shortcut. The generated icon is the safe path.'
         $iconValue = $SystemIcon
     }
     else {
@@ -572,7 +1074,7 @@ if ($Action -eq 'Remove') {
         $len  = (Get-Item -LiteralPath $IcoPath).Length
         $sz   = ($test.Sizes | Sort-Object -Unique) -join ','
         $hash = (Get-FileHash -LiteralPath $IcoPath -Algorithm SHA256).Hash
-        Write-Log ('  icon ready: {0} bytes  format={1}  sizes={2}  pixelCheck={3}' -f $len, $test.Format, $sz, $test.PixelCheck)
+        Write-Log ('  icon ready: {0} bytes  format={1}  sizes={2}  ink={3}  maxInkAlpha={4}' -f $len, $test.Format, $sz, $test.TotalInk, $test.MaxInkAlpha)
         Write-Log ('  sha256    : ' + $hash)
 
         if (-not $test.Ok) {
@@ -582,6 +1084,13 @@ if ($Action -eq 'Remove') {
         }
         $iconValue = $IcoPath
     }
+
+    # Order matters: stop the shell first, then drop the icon cache it is
+    # holding open, then write the registry, then start the shell again.
+    # v1.3.0 cleared the cache with explorer still running, which deleted
+    # nothing and left the stale (black) composites cached.
+    if (-not $NoRestart) { Stop-Explorer }
+    [void](Clear-IconCache)
 
     foreach ($slot in $slots) {
         if ($slot -eq $ShieldSlot) {
@@ -596,8 +1105,32 @@ if ($Action -eq 'Remove') {
         [void](Set-OverlaySlot -Hive 'HKCU:' -Slot $slot -IconValue $iconValue)
     }
 
-    Clear-IconCache
-    if (-not $NoRestart) { Restart-Explorer }
+    if (-not $NoRestart) { Start-Explorer }
+
+    # End-to-end verification. If the desktop came out worse than it went in,
+    # undo the change instead of leaving a broken desktop behind.
+    $result = Test-OverlayResult
+    Write-Log ('  overlay check: ' + $result.Verdict)
+    foreach ($d in $result.Details) {
+        Write-Log ('    {0} = {1}% opaque black' -f $d.Name, $d.BlackPercent)
+    }
+
+    if (-not $result.Ok) {
+        Write-Log '  FAIL: the overlay made shortcuts render as black squares.'
+        Write-Log '        Rolling the change back ...'
+        foreach ($slot in @($ArrowSlot, $ShieldSlot)) {
+            if ($isAdmin) { Remove-OverlaySlot -Hive 'HKLM:' -Slot $slot }
+            Remove-OverlaySlot -Hive 'HKCU:' -Slot $slot
+        }
+        if (-not $NoRestart) {
+            Stop-Explorer
+            [void](Clear-IconCache)
+            Start-Explorer
+        }
+        Write-Log '  rolled back: no overlay icon is registered any more.'
+        Write-Log '  Please report this, including ShortcutArrow.log and your Windows build.'
+        exit 1
+    }
 
     Write-Log '=== done. ==='
     if (-not $isAdmin) {
@@ -606,10 +1139,13 @@ if ($Action -eq 'Remove') {
     if (-not $IncludeShield) {
         Write-Log 'NOTE: the UAC shield was left untouched. Add -IncludeShield to hide it too.'
     }
-    Write-Log 'NOTE: if every shortcut ever turns into a black square, run'
-    Write-Log '      -Action Restore right away and report it.'
+    Write-Log 'NOTE: every run now measures the desktop afterwards and rolls back by'
+    Write-Log '      itself if shortcuts ever come out as black squares.'
 }
 else {
+    if (-not $NoRestart) { Stop-Explorer }
+    [void](Clear-IconCache)
+
     # Restore always clears BOTH slots, so a hidden shield can never linger
     # by accident after a partial run.
     foreach ($slot in @($ArrowSlot, $ShieldSlot)) {
@@ -618,8 +1154,10 @@ else {
         Remove-OverlaySlot -Hive 'HKCU:' -Slot $slot
     }
 
-    Clear-IconCache
-    if (-not $NoRestart) { Restart-Explorer }
+    if (-not $NoRestart) { Start-Explorer }
+
+    $result = Test-OverlayResult
+    Write-Log ('  overlay check: ' + $result.Verdict)
 
     Write-Log '=== done. Shortcut arrow and UAC shield restored to Windows defaults. ==='
     if (Test-Path -LiteralPath $IcoDir) {
@@ -627,3 +1165,5 @@ else {
         Write-Log '      Re-running -Action Remove regenerates the icon in the current format.'
     }
 }
+
+}   # if (-not $Script:DotSourced)
