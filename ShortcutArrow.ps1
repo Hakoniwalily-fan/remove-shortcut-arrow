@@ -64,13 +64,26 @@
             In the regression test the first sample read 38% and the
             second read 100% - which is what triggered the rollback.
 
-      * Icon cache clearing is reordered: explorer.exe is stopped FIRST,
-        then the cache files are deleted, then the registry is written,
-        then explorer is started. v1.3.0 deleted the cache while explorer
-        was still running, which silently failed (measured on the
-        affected machine: 30 files present, 0 deleted) and left the black
-        composites cached. The number of files actually deleted is now
-        logged instead of an unconditional "icon cache cleared".
+      * Operation order fixed: the registry is written FIRST, then the shell is
+        stopped, its icon cache deleted, and the shell started again.
+        v1.3.0 deleted the cache while explorer was still running, which
+        silently failed (measured: 30 files present, 0 deleted). Writing the
+        registry AFTER restarting the shell is just as bad: Windows restarts
+        explorer.exe by itself (AutoRestartShell is on by default), and a shell
+        that comes back before the registry write rebuilds its icon cache from
+        the OLD value. The desktop then keeps showing the previous overlay while
+        every fresh process reads the new registry value and reports "normal".
+        Reproduced live on the affected machine: shortcuts stayed red after a
+        red probe icon was removed. The number of cache files actually deleted
+        is logged instead of an unconditional "icon cache cleared".
+
+      * Measured how slots 29/77 are actually painted on the affected machine,
+        by registering an opaque RED probe icon: the overlay covers the ENTIRE
+        shortcut icon (all 1024 pixels of a 32x32 icon turn red) and nothing is
+        layered on top of it - the overlay REPLACES the arrow rather than
+        sitting under it. That is why a completely empty overlay is so
+        destructive there (the whole icon goes black) and why a single faint
+        ink pixel is enough to make it invisible.
 
       * -IconFormat values renamed to say what they do:
           Faint32bpp  (default, safe)   one ink pixel at alpha = 2/255
@@ -809,19 +822,27 @@ function Test-OverlayResult {
 }
 
 function Stop-Explorer {
+    <#
+        Kill the shell and wait for it to be gone, so its icon cache files can
+        be deleted (the shell holds them open).
+
+        Windows restarts explorer.exe on its own (AutoRestartShell is on by
+        default), sometimes within a second or two. That is harmless now,
+        because the caller writes the registry BEFORE stopping the shell: a
+        shell that comes back already reads the new value. Clear-IconCache
+        retries if a cache file still turns out to be locked.
+    #>
     Write-Log '  stopping explorer.exe ...'
     Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
-    for ($i = 0; $i -lt 20; $i++) {
-        if (-not (Get-Process explorer -ErrorAction SilentlyContinue)) { break }
+    for ($i = 0; $i -lt 16; $i++) {
+        if (-not (Get-Process explorer -ErrorAction SilentlyContinue)) {
+            Start-Sleep -Milliseconds 400
+            if (-not (Get-Process explorer -ErrorAction SilentlyContinue)) { return }
+        }
         Start-Sleep -Milliseconds 250
     }
-    if (Get-Process explorer -ErrorAction SilentlyContinue) {
-        # Windows restarts the shell on its own when AutoRestartShell is on
-        # (the default), so this is expected rather than fatal. Clear-IconCache
-        # retries if a cache file turns out to be locked.
-        Write-Log '  note: explorer.exe is running again (Windows restarts the shell by'
-        Write-Log '        itself). If a cache file is locked, it is retried below.'
-    }
+    Write-Log '  note: explorer.exe is running again (Windows restarts the shell itself);'
+    Write-Log '        the cache step retries if a file is locked.'
 }
 
 function Start-Explorer {
@@ -1085,13 +1106,15 @@ if ($Action -eq 'Remove') {
         $iconValue = $IcoPath
     }
 
-    # Order matters: stop the shell first, then drop the icon cache it is
-    # holding open, then write the registry, then start the shell again.
-    # v1.3.0 cleared the cache with explorer still running, which deleted
-    # nothing and left the stale (black) composites cached.
-    if (-not $NoRestart) { Stop-Explorer }
-    [void](Clear-IconCache)
-
+    # Order matters, and getting it wrong is worse than doing nothing:
+    #   1. write the registry FIRST
+    #   2. only then stop the shell, clear its cache and start it again
+    # Windows restarts explorer.exe by itself (AutoRestartShell is on by
+    # default). A shell that starts BEFORE the registry write reads the OLD
+    # value and rebuilds its icon cache from it, so the desktop keeps showing
+    # the previous overlay. Observed on the affected machine: shortcuts stayed
+    # red after the red probe was removed, while every fresh process (including
+    # the end-to-end check) read the new registry value and reported "normal".
     foreach ($slot in $slots) {
         if ($slot -eq $ShieldSlot) {
             Write-Log '  note: hiding the shield only hides the warning icon.'
@@ -1105,6 +1128,8 @@ if ($Action -eq 'Remove') {
         [void](Set-OverlaySlot -Hive 'HKCU:' -Slot $slot -IconValue $iconValue)
     }
 
+    if (-not $NoRestart) { Stop-Explorer }
+    [void](Clear-IconCache)
     if (-not $NoRestart) { Start-Explorer }
 
     # End-to-end verification. If the desktop came out worse than it went in,
@@ -1143,9 +1168,7 @@ if ($Action -eq 'Remove') {
     Write-Log '      itself if shortcuts ever come out as black squares.'
 }
 else {
-    if (-not $NoRestart) { Stop-Explorer }
-    [void](Clear-IconCache)
-
+    # Registry first, shell restart second - see the note in the Remove branch.
     # Restore always clears BOTH slots, so a hidden shield can never linger
     # by accident after a partial run.
     foreach ($slot in @($ArrowSlot, $ShieldSlot)) {
@@ -1154,6 +1177,8 @@ else {
         Remove-OverlaySlot -Hive 'HKCU:' -Slot $slot
     }
 
+    if (-not $NoRestart) { Stop-Explorer }
+    [void](Clear-IconCache)
     if (-not $NoRestart) { Start-Explorer }
 
     $result = Test-OverlayResult

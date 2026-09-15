@@ -51,6 +51,13 @@ why v1.3.0's 1bpp rewrite still blackened every icon. v1.4.0 therefore writes a
 32bpp icon with a single `alpha = 2/255` pixel (0.8% opacity, invisible to the
 eye) and an AND mask that matches it.
 
+On the affected machine the overlay is painted across the **whole** shortcut
+icon, not just the bottom-left corner: registering an opaque red probe icon
+turned all 1024 pixels of every 32x32 shortcut icon red, and nothing was layered
+on top of it — the overlay *replaces* the arrow rather than sitting under it.
+That is why a completely empty overlay is so destructive there, and why a single
+faint ink pixel is enough to make it invisible.
+
 Two other suspects were ruled out by measurement rather than by argument:
 
 | Hypothesis | Result |
@@ -318,25 +325,33 @@ its ink, and the validator must reject both legacy empty formats.
    sizes, one faint ink pixel, parsed and verified before use. An existing file
    is re-checked on every run and regenerated when it is empty or otherwise
    fails verification; `-Force` always regenerates
-2. **Stops `explorer.exe`**, then clears the icon cache (`IconCache.db`,
-   `iconcache_*.db`, `thumbcache_*.db`) while the shell is down, and logs how
-   many files were actually deleted. Doing this in the other order deletes
-   nothing (measured: 30 files present, 0 deleted) and leaves the stale
-   composites in place
-3. Sets `Shell Icons` slot `29` — and slot `77` too with `-IncludeShield`
+2. **Writes the registry first** — `Shell Icons` slot `29`, and slot `77` too
+   with `-IncludeShield`
    - elevated → `HKLM` (documented location, machine-wide)
    - not elevated → falls back to `HKCU`
    - every write is read back and compared, so a silent failure is reported
-4. Starts `explorer.exe`
-5. **Measures the result** — in a child process, sampling over a short window —
+3. Then stops `explorer.exe`, waits for it to actually be gone, clears the icon
+   cache (`IconCache.db`, `iconcache_*.db`, `thumbcache_*.db`) and logs how many
+   files were really deleted, then starts the shell again
+4. **Measures the result** — in a child process, sampling over a short window —
    and rolls the whole change back automatically if any shortcut came out as a
    black square
 
+> **Why the order matters.** Getting it wrong looks like the change silently
+> doing nothing. Deleting the cache while the shell runs deletes nothing at all
+> (measured: 30 files present, 0 deleted). And Windows restarts `explorer.exe` by
+> itself (`AutoRestartShell`), so writing the registry *after* restarting the
+> shell lets the returning shell rebuild its icon cache from the **old** value:
+> the desktop keeps showing the previous overlay while every fresh process reads
+> the new registry and reports "normal". Both orderings were reproduced live here
+> — shortcuts stayed arrowed after the blank icon was installed, and stayed red
+> after a red probe icon was removed.
+
 **`-Action Restore`**
 
-1. Stops `explorer.exe` and clears the icon cache (same order as above)
-2. Deletes slots `29` **and** `77` from `HKLM` and `HKCU`
-3. Starts `explorer.exe` and measures the result
+1. Deletes slots `29` **and** `77` from `HKLM` and `HKCU` (registry first)
+2. Stops `explorer.exe`, clears the icon cache, and starts the shell again
+3. Measures the result
 
 **`-Action Verify`**
 
@@ -451,6 +466,11 @@ NVIDIA 独显），注册表槽位、图标路径、图标缓存全部保持不�
 生成的是 32bpp 图标，其中**只有一个 `alpha = 2/255` 的像素**（0.8% 不透明度，肉眼不可见），
 并让 AND 掩码与之一致。
 
+在出问题的机器上，这个覆盖层是**铺满整张图标**绘制的，不是只画在左下角：注册一张不透明的
+**红色探针图标**后，每个 32×32 快捷方式图标上 **1024/1024 个像素全变红**，而且红色**上面并
+没有叠着箭头**——也就是说覆盖层是**替代**箭头，而不是叠在它下面。这解释了为什么「全空覆盖层」
+在这里破坏力这么大（整张图标变黑），也解释了为什么**一个极淡的像素**就足以让它隐形。
+
 另外两个怀疑对象是靠实测排除的，不是靠推理：
 
 | 怀疑对象 | 结论 |
@@ -556,6 +576,18 @@ v1.4.0 生成的是**每个像素都透明、只有一个像素例外**的 32bpp
 在真正写注册表之前，脚本会**直接从字节解析**生成的文件（`Get-IcoContent`）：统计墨迹像素数，
 并检查 AND 掩码是否与墨迹一致。图标全空、含不透明黑像素、或掩码与墨迹矛盾，都会**中止**，
 注册表一点都不动。
+
+#### 顺序为什么重要
+
+写注册表和重启 shell 的**顺序错了，效果就等同于「什么都没做」**：
+
+- 在 shell 还在运行时删图标缓存 → 一个文件都删不掉（实测：30 个文件，删掉 0 个）。
+- 先重启 shell、后写注册表 → Windows 会**自动重启 explorer**（`AutoRestartShell` 默认开启），
+  抢先启动的那个 shell 读到的是**旧值**，并按旧值重建了图标缓存：**桌面继续显示旧的覆盖层**，
+  而任何新进程去读注册表都会报「正常」。这两种顺序都在本机复现过——装完空白图标后小箭头仍在、
+  撤掉红色探针后图标仍然是红的。
+
+所以脚本的顺序固定为：**先写注册表 → 再停 shell → 删缓存 → 启 shell → 实测校验**。
 
 ### 图标为什么放在 `%LOCALAPPDATA%`
 
